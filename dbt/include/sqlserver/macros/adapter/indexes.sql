@@ -116,6 +116,28 @@
 {%- endmacro %}
 
 
+{% macro drop_all_nonclustered_indexes_on_table() -%}
+    {# Altered from https://stackoverflow.com/q/1344401/10415173 #}
+    {# and https://stackoverflow.com/a/33785833/10415173         #}
+
+    {{ log("Dropping nonclustered indexes...") }}
+
+    declare @drop_nonclustered_indexes nvarchar(max);
+    select @drop_nonclustered_indexes = (
+        select 'IF INDEXPROPERTY(' + CONVERT(VARCHAR(MAX), sys.tables.[object_id]) + ', ''' + sys.indexes.[name] + ''', ''IndexId'') IS NOT NULL DROP INDEX [' + sys.indexes.[name] + '] ON ' + '[' + SCHEMA_NAME(sys.tables.[schema_id]) + '].[' + OBJECT_NAME(sys.tables.[object_id]) + ']; '
+        from sys.indexes {{ information_schema_hints() }}
+        inner join sys.tables {{ information_schema_hints() }}
+        on sys.indexes.object_id = sys.tables.object_id
+        where sys.indexes.[name] is not null
+        and sys.indexes.type_desc = 'NONCLUSTERED'
+        and SCHEMA_NAME(sys.tables.schema_id) = '{{ this.schema }}'
+        and sys.tables.[name] = '{{ this.table }}'
+        for xml path('')
+    ); exec sp_executesql @drop_nonclustered_indexes;
+
+{%- endmacro %}
+
+
 {% macro create_clustered_index(columns, unique=False) -%}
     {{ log("Creating clustered index...") }}
 

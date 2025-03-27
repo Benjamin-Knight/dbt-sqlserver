@@ -66,6 +66,22 @@ drop_schema_model = """
 select * from {{ ref('raw_data') }}
 """
 
+drop_nonclustered_model = """
+{{
+  config({
+  "materialized": 'table',
+  "as_columnstore": False,
+        "post-hook": [
+            "{{ create_clustered_index(columns = ['id_col'], unique=True) }}",
+            "{{ create_nonclustered_index(columns = ['data']) }}",
+            "{{ create_nonclustered_index(columns = ['secondary_data'], includes = ['tertiary_data']) }}",
+            "{{ drop_all_nonclustered_indexes_on_table() }}",
+        ]
+  })
+}}
+select * from {{ ref('raw_data') }}
+"""
+
 base_validation = """
 with base_query AS (
 select i.[name] as index_name,
@@ -244,3 +260,43 @@ class TestIndexDropsOnlySchema:
         run_dbt(["run"])
         self.validate_other_schema(project)
         self.drop_schema_artifacts(project)
+
+
+class TestDropNonClusteredIndex:
+    @pytest.fixture(scope="class")
+    def project_config_update(self):
+        return {"name": "generic_tests"}
+
+    @pytest.fixture(scope="class")
+    def seeds(self):
+        return {
+            "raw_data.csv": index_seed_csv,
+            "schema.yml": index_schema_base_yml,
+        }
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "index_model.sql": drop_nonclustered_model,
+            "index_ccs_model.sql": model_sql_ccs,
+            "schema.yml": model_yml,
+        }
+
+    def test_drop_index(self, project):
+        run_dbt(["seed"])
+        run_dbt(["run"])
+
+        with get_connection(project.adapter):
+            result, table = project.adapter.execute(
+                index_count.format(schema_name=project.created_schemas[0]), fetch=True
+            )
+        schema_dict = {_[0]: _[1] for _ in table.rows}
+        expected = {
+            # The clustered indices should have been preserved
+            "Clustered columnstore index": 1,
+            "Clustered index": 1,
+            # We should have 2 rather than 4 as the last run post hook on drop_nonclustered_model
+            # should drop the nonclustered indexes
+            "Nonclustered unique index": 2,
+        }
+        assert schema_dict == expected
