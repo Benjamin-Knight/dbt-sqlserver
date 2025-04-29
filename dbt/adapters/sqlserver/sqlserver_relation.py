@@ -31,7 +31,7 @@ class SQLServerRelation(BaseRelation):
         and instead rely on the end user to set an alias. However in the instance where we
         are using a limit and an event time filter we need to set an alias on the event time filter
         """
-        if self.require_alias or (self.limit is not None and self.namespace == "et_filter"):
+        if self.require_alias or (self.limit is not None and namespace == "et_filter"):
             return f" _dbt_{namespace}_subq_{self.table}"
         return ""
 
