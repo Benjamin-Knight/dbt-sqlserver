@@ -25,16 +25,6 @@ class SQLServerRelation(BaseRelation):
     def get_relation_type(cls) -> Type[SQLServerRelationType]:
         return SQLServerRelationType
 
-    def _render_subquery_alias(self, namespace: str) -> str:
-        """
-        Returns the subquery alias for the relation, in almost all cases we will not set an alias
-        and instead rely on the end user to set an alias. However in the instance where we
-        are using a limit and an event time filter we need to set an alias on the event time filter
-        """
-        if self.require_alias or (self.limit is not None and namespace == "et_filter"):
-            return f" _dbt_{namespace}_subq_{self.table}"
-        return ""
-
     def render_limited(self) -> str:
         rendered = self.render()
         if self.limit is None:
@@ -59,6 +49,20 @@ class SQLServerRelation(BaseRelation):
 
     def relation_max_name_length(self):
         return MAX_CHARACTERS_IN_IDENTIFIER
+
+    def render_event_time_filtered(self, rendered: Optional[str] = None) -> str:
+        rendered = rendered or self.render()
+        if self.event_time_filter is None:
+            return rendered
+
+        filter = self._render_event_time_filtered(self.event_time_filter)
+        if not filter:
+            return rendered
+
+        return (
+            f"(select * from {rendered} as event_time_filter where"
+            f" {filter}){self._render_subquery_alias(namespace='et_filter')}"
+        )
 
     def _render_event_time_filtered(self, event_time_filter: EventTimeFilter) -> str:
         """
