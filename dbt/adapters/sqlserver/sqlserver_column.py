@@ -6,11 +6,11 @@ from dbt_common.exceptions import DbtRuntimeError
 
 class SQLServerColumn(Column):
     TYPE_LABELS: ClassVar[Dict[str, str]] = {
-        "STRING": "VARCHAR(8000)",
+        "STRING": "VARCHAR(MAX)",
         "VARCHAR": "VARCHAR(8000)",
         "CHAR": "CHAR(1)",
-        "NCHAR": "CHAR(1)",
-        "NVARCHAR": "VARCHAR(8000)",
+        "NCHAR": "NCHAR(1)",
+        "NVARCHAR": "NVARCHAR(8000)",
         "TIMESTAMP": "DATETIME2(6)",
         "DATETIME2": "DATETIME2(6)",
         "DATETIME2(6)": "DATETIME2(6)",
