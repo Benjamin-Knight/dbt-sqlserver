@@ -1,7 +1,22 @@
-{% macro apply_label() %}
+
+{% macro get_query_options(parse_options=False) %}
     {{ log (config.get('query_tag','dbt-sqlserver'))}}
     {%- set query_label = config.get('query_tag','dbt-sqlserver') -%}
-    OPTION (LABEL = '{{query_label}}');
+    {%- set query_options = config.get('query_options', {}) -%}
+
+    {%- set options_list = ["LABEL = '" ~ query_label ~ "'"] -%}
+
+    {%- if parse_options -%}
+        {%- for key, value in query_options.items() -%}
+            {%- if value is none -%}
+                {%- do options_list.append(key) -%}
+            {%- else -%}
+                {%- do options_list.append(key ~ ' ' ~ value) -%}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+
+    OPTION ({{ options_list | join(', ') }});
 {% endmacro %}
 
 {% macro default__information_schema_hints() %}{% endmacro %}
@@ -27,14 +42,14 @@
   {% call statement('list_schemas', fetch_result=True, auto_begin=False) -%}
     {{ get_use_database_sql(database) }}
     select  name as [schema]
-    from sys.schemas {{ information_schema_hints() }} {{ apply_label() }}
+    from sys.schemas {{ information_schema_hints() }} {{ get_query_options() }}
   {% endcall %}
   {{ return(load_result('list_schemas').table) }}
 {% endmacro %}
 
 {% macro sqlserver__check_schema_exists(information_schema, schema) -%}
   {% call statement('check_schema_exists', fetch_result=True, auto_begin=False) -%}
-    SELECT count(*) as schema_exist FROM sys.schemas WHERE name = '{{ schema }}' {{ apply_label() }}
+    SELECT count(*) as schema_exist FROM sys.schemas WHERE name = '{{ schema }}' {{ get_query_options() }}
   {%- endcall %}
   {{ return(load_result('check_schema_exists').table) }}
 {% endmacro %}
@@ -59,7 +74,7 @@
     )
     select * from base
     where [schema] like '{{ schema_relation.schema }}'
-    {{ apply_label() }}
+    {{ get_query_options() }}
   {% endcall %}
   {{ return(load_result('list_relations_without_caching').table) }}
 {% endmacro %}
@@ -85,7 +100,7 @@
     select * from base
     where [schema] like '{{ schema_relation.schema }}'
     and [name] like '{{ schema_relation.identifier }}'
-    {{ apply_label() }}
+    {{ get_query_options() }}
   {% endcall %}
   {{ return(load_result('get_relation_without_caching').table) }}
 {% endmacro %}
@@ -105,7 +120,7 @@
                 upper(o.name) = upper('{{ relation.identifier }}')){%- if not loop.last %} or {% endif -%}
             {%- endfor -%}
         )
-        {{ apply_label() }}
+        {{ get_query_options() }}
   {%- endcall -%}
   {{ return(load_result('last_modified')) }}
 

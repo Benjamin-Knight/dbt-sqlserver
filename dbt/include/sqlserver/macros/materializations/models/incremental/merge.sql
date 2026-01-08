@@ -8,7 +8,7 @@
 
 {% macro sqlserver__get_delete_insert_merge_sql(target, source, unique_key, dest_columns, incremental_predicates=none) %}
 
-    {% set query_label = apply_label() %}
+    {% set query_label = get_query_options() %}
     {%- set dest_cols_csv = get_quoted_csv(dest_columns | map(attribute="name")) -%}
 
     {% if unique_key %}
