@@ -41,6 +41,38 @@ class SQLServerColumn(Column):
     def literal(self, value: Any) -> str:
         return "cast('{}' as {})".format(value, self.data_type)
 
+
+class SQLServerColumnLegacy(SQLServerColumn):
+    TYPE_LABELS: ClassVar[Dict[str, str]] = {
+        "STRING": "VARCHAR(8000)",
+        "VARCHAR": "VARCHAR(8000)",
+        "CHAR": "CHAR(1)",
+        "NCHAR": "CHAR(1)",
+        "NVARCHAR": "VARCHAR(8000)",
+        "TIMESTAMP": "DATETIME2(6)",
+        "DATETIME2": "DATETIME2(6)",
+        "DATETIME2(6)": "DATETIME2(6)",
+        "DATE": "DATE",
+        "TIME": "TIME(6)",
+        "FLOAT": "FLOAT",
+        "REAL": "REAL",
+        "INT": "INT",
+        "INTEGER": "INT",
+        "BIGINT": "BIGINT",
+        "SMALLINT": "SMALLINT",
+        "TINYINT": "SMALLINT",
+        "BIT": "BIT",
+        "BOOLEAN": "BIT",
+        "DECIMAL": "DECIMAL",
+        "NUMERIC": "NUMERIC",
+        "MONEY": "DECIMAL",
+        "SMALLMONEY": "DECIMAL",
+        "UNIQUEIDENTIFIER": "UNIQUEIDENTIFIER",
+        "VARBINARY": "VARBINARY(MAX)",
+        "BINARY": "BINARY(1)",
+        "BINARY": "BINARY(1)",
+    }
+
     @property
     def data_type(self) -> str:
         # Always enforce datetime2 precision

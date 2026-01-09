@@ -18,7 +18,7 @@ from dbt_common.contracts.constraints import (
 )
 from dbt_common.events.functions import fire_event
 
-from dbt.adapters.sqlserver.sqlserver_column import SQLServerColumn
+from dbt.adapters.sqlserver.sqlserver_column import SQLServerColumn, SQLServerColumnLegacy
 from dbt.adapters.sqlserver.sqlserver_configs import SQLServerConfigs
 from dbt.adapters.sqlserver.sqlserver_connections import SQLServerConnectionManager
 from dbt.adapters.sqlserver.sqlserver_relation import SQLServerRelation
@@ -48,6 +48,11 @@ class SQLServerAdapter(SQLAdapter):
         ConstraintType.foreign_key: ConstraintSupport.ENFORCED,
     }
 
+    def __init__(self, config, mp_context=None):
+        super().__init__(config, mp_context)
+        if hasattr(config, "flags") and config.flags and config.flags.get("MSSQL_LEGACY_STRING_TYPES", False):
+            self.Column = SQLServerColumnLegacy
+
     @property
     def _behavior_flags(self) -> List[BehaviorFlag]:
         return [
@@ -69,6 +74,13 @@ class SQLServerAdapter(SQLAdapter):
                     "`custom_schema_name` is used directly without prefixing `target.schema`. "
                     "For a permanent solution, override the `sqlserver__generate_schema_name` "
                     "macro in your project instead."
+                ),
+            },
+            {
+                "name": "MSSQL_LEGACY_STRING_TYPES",
+                "default": False,
+                "description": (
+                    "When enabled, uses legacy data type mappings for string types."
                 ),
             },
         ]
