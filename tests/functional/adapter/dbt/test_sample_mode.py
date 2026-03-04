@@ -10,14 +10,14 @@ from dbt.tests.adapter.sample_mode.test_sample_mode import (
 from dbt.tests.util import run_dbt
 
 # BaseSampleModeTest.test_sample_mode uses @freezegun.freeze_time("2025-01-03T02:03:0Z")
-# We align our static dates to ensure the "1 day" sample works correctly.
+# We align our static dates to ensure the "1 day" sample [2025-01-02 02:03:00, 2025-01-03 02:03:00) works.
 _input_model_sql = """
 {{ config(materialized='table', event_time='event_time') }}
 select 1 as id, cast('2025-01-01 02:03:00' as datetime2) as event_time
 UNION ALL
 select 2 as id, cast('2025-01-02 14:03:00' as datetime2) as event_time
 UNION ALL
-select 3 as id, cast('2025-01-03 02:03:00' as datetime2) as event_time
+select 3 as id, cast('2025-01-03 02:02:59' as datetime2) as event_time
 """
 
 
