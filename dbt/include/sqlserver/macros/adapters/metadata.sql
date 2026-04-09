@@ -7,11 +7,43 @@
     {%- set options_list = ["LABEL = '" ~ query_label ~ "'"] -%}
 
     {%- if parse_options -%}
+        {%- set valid_options = [
+            'HASH GROUP', 'ORDER GROUP',
+            'CONCAT UNION', 'HASH UNION', 'MERGE UNION',
+            'LOOP JOIN', 'MERGE JOIN', 'HASH JOIN',
+            'DISABLE_OPTIMIZED_PLAN_FORCING',
+            'EXPAND VIEWS',
+            'FAST',
+            'FORCE ORDER',
+            'FORCE EXTERNALPUSHDOWN', 'DISABLE EXTERNALPUSHDOWN',
+            'FORCE SCALEOUTEXECUTION', 'DISABLE SCALEOUTEXECUTION',
+            'IGNORE_NONCLUSTERED_COLUMNSTORE_INDEX',
+            'KEEP PLAN',
+            'KEEPFIXED PLAN',
+            'MAX_GRANT_PERCENT',
+            'MIN_GRANT_PERCENT',
+            'MAXDOP',
+            'MAXRECURSION',
+            'NO_PERFORMANCE_SPOOL',
+            'OPTIMIZE FOR UNKNOWN',
+            'PARAMETERIZATION',
+            'QUERYTRACEON',
+            'RECOMPILE',
+            'ROBUST PLAN',
+        ] -%}
+
         {%- for key, value in query_options.items() -%}
+            {%- if key | upper not in valid_options -%}
+                {{ exceptions.raise_compiler_error("Invalid query option: '" ~ key ~ "'. Must be one of: " ~ valid_options | join(', ')) }}
+            {%- endif -%}
+
             {%- if value is none -%}
-                {%- do options_list.append(key) -%}
+                {%- do options_list.append(key | upper) -%}
             {%- else -%}
-                {%- do options_list.append(key ~ ' ' ~ value) -%}
+                {%- if value is not number -%}
+                    {{ exceptions.raise_compiler_error("Query option '" ~ key ~ "' value must be a number, got: '" ~ value ~ "'") }}
+                {%- endif -%}
+                {%- do options_list.append(key | upper ~ ' ' ~ value | int) -%}
             {%- endif -%}
         {%- endfor -%}
     {%- endif -%}

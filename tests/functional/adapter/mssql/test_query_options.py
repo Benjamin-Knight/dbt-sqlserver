@@ -1,3 +1,5 @@
+import os
+
 import pytest
 from dbt.tests.util import run_dbt
 
@@ -18,6 +20,7 @@ WITH cte AS (
 SELECT * FROM cte
 """
 
+
 class TestQueryOptionsRecursive:
     @pytest.fixture(scope="class")
     def models(self):
@@ -26,9 +29,9 @@ class TestQueryOptionsRecursive:
         }
 
     def test_max_recursion_option(self, project):
-        # This model requires recursion > 100 (default). 
-        # Without MAXRECURSION 200 it would fail.
-        run_dbt(["run"])
+        results = run_dbt(["run"])
+        assert len(results) == 1
+        assert results[0].status == "success"
 
 
 generic_options_model_sql = """
@@ -43,19 +46,19 @@ generic_options_model_sql = """
 select 1 as id
 """
 
+
 class TestQueryOptionsGeneric:
     @pytest.fixture(scope="class")
     def models(self):
         return {
-             "generic_model.sql": generic_options_model_sql,
+            "generic_model.sql": generic_options_model_sql,
         }
-    
-    
-    def test_generic_option(self, project):
-         # Just testing that it compiles and runs with other options
-         run_dbt(["run"])
 
-import os 
+    def test_generic_option(self, project):
+        results = run_dbt(["run"])
+        assert len(results) == 1
+        assert results[0].status == "success"
+
 
 class TestQueryOptionsRestriction:
     @pytest.fixture(scope="class")
@@ -66,24 +69,61 @@ class TestQueryOptionsRestriction:
         }
 
     def test_table_respects_options(self, project):
-        run_dbt(["run"])
-        
-        path = os.path.join(project.project_root, "target/run/test/models/table_model.sql")
+        run_dbt(["run", "--select", "table_model"])
+
+        path = os.path.join(project.project_root, "target", "run", project.test_schema, "models", "table_model.sql")
+        if not os.path.exists(path):
+            # Fall back to searching for compiled SQL
+            target_dir = os.path.join(project.project_root, "target", "run")
+            for root, dirs, files in os.walk(target_dir):
+                if "table_model.sql" in files:
+                    path = os.path.join(root, files[files.index("table_model.sql")])
+                    break
+
         with open(path, "r") as f:
             sql = f.read()
-        
+
         assert "MAXDOP 1" in sql
         assert "LABEL =" in sql
 
     def test_view_ignores_options(self, project):
         run_dbt(["run", "--select", "view_model"])
-        
-        # Check target/run (create view statement is executed)
-        path = os.path.join(project.project_root, "target/run/test/models/view_model.sql")
+
+        target_dir = os.path.join(project.project_root, "target", "run")
+        path = None
+        for root, dirs, files in os.walk(target_dir):
+            if "view_model.sql" in files:
+                path = os.path.join(root, files[files.index("view_model.sql")])
+                break
+
+        assert path is not None, "Could not find compiled view_model.sql"
         with open(path, "r") as f:
             sql = f.read()
-            
-        # Views do not use get_query_options in default dbt-sqlserver implementation.
-        # So MAXDOP should not be present.
+
         assert "MAXDOP" not in sql
 
+
+invalid_option_model_sql = """
+{{
+  config({
+    "materialized": 'table',
+    "query_options": {
+      "INVALID_OPTION": 1
+    }
+  })
+}}
+select 1 as id
+"""
+
+
+class TestQueryOptionsValidation:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "invalid_model.sql": invalid_option_model_sql,
+        }
+
+    def test_invalid_option_raises_error(self, project):
+        results = run_dbt(["run"], expect_pass=False)
+        assert len(results) == 1
+        assert results[0].status == "error"
