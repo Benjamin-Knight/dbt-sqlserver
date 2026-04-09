@@ -50,7 +50,7 @@ class SQLServerAdapter(SQLAdapter):
 
     def __init__(self, config, mp_context=None):
         super().__init__(config, mp_context)
-        if hasattr(config, "flags") and config.flags and config.flags.get("MSSQL_LEGACY_STRING_TYPES", False):
+        if self.behavior.MSSQL_LEGACY_STRING_TYPES:
             self.Column = SQLServerColumnLegacy
 
     @property
