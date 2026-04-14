@@ -101,6 +101,34 @@ dml_contract_model_v2_sql = """
 select 2 as id, 'world' as val
 """
 
+dml_cte_model_sql = """
+{{
+  config({
+    "materialized": "table",
+    "table_refresh_method": "dml",
+    "as_columnstore": False
+  })
+}}
+with cte as (
+  select 1 as id, 'hello' as val
+)
+select * from cte
+"""
+
+dml_cte_model_v2_sql = """
+{{
+  config({
+    "materialized": "table",
+    "table_refresh_method": "dml",
+    "as_columnstore": False
+  })
+}}
+with cte as (
+  select 2 as id, 'world' as val
+)
+select * from cte
+"""
+
 dml_contract_schema_yml = """
 version: 2
 models:
@@ -373,3 +401,38 @@ class TestDmlRefreshWithContract:
         rows = query_table(project, "dml_contract_model")
         assert len(rows) == 1
         assert rows[0][0] == 2
+
+
+# -- Test: DML refresh works with CTEs in model SQL --
+
+class TestDmlRefreshWithCTE:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {"dml_cte_model.sql": dml_cte_model_sql}
+
+    def test_cte_model_dml_refresh(self, project):
+        # First run — creates the table (uses CREATE path, no DML refresh)
+        results = run_dbt(["run"])
+        assert len(results) == 1
+        assert results[0].status == "success"
+
+        rows = query_table(project, "dml_cte_model")
+        assert len(rows) == 1
+        assert rows[0][0] == 1
+        assert rows[0][1] == "hello"
+
+        # Swap in v2 model with CTE but different data
+        write_model(project, "dml_cte_model.sql", dml_cte_model_v2_sql)
+
+        # Second run — DML refresh with CTE-based SQL
+        results = run_dbt(["run"])
+        assert len(results) == 1
+        assert results[0].status == "success"
+
+        rows = query_table(project, "dml_cte_model")
+        assert len(rows) == 1
+        assert rows[0][0] == 2
+        assert rows[0][1] == "world"
+
+        # Scratch table should be cleaned up
+        assert not table_exists(project, "dml_cte_model__dbt_refresh")

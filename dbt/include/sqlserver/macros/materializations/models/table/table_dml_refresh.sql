@@ -18,16 +18,28 @@
   {%- set refresh_relation = target_relation.incorporate(
       path={"identifier": target_relation.identifier ~ '__dbt_refresh'}
   ) -%}
+  {%- set tmp_vw_relation = refresh_relation.incorporate(
+      path={"identifier": refresh_relation.identifier ~ '__dbt_tmp_vw'}
+  ) -%}
 
-  {# Clean up any leftover scratch table from a prior failed run #}
+  {# Clean up any leftovers from a prior failed run #}
   {% call statement('dml_refresh_cleanup_pre') -%}
+    DROP VIEW IF EXISTS {{ tmp_vw_relation.include(database=False) }};
     DROP TABLE IF EXISTS {{ refresh_relation }};
   {%- endcall %}
 
-  {# Build new data into scratch table (heap — minimally logged under SIMPLE recovery) #}
+  {# Build new data into scratch table via temp view (handles CTEs in model SQL) #}
   {# Named 'main' because dbt requires a statement('main') call in every materialization #}
+  {% call statement('dml_refresh_create_view') -%}
+    {{ get_create_view_as_sql(tmp_vw_relation, sql) }}
+  {%- endcall %}
+
   {% call statement('main') -%}
-    SELECT * INTO {{ refresh_relation }} FROM ({{ sql }}) AS __dbt_sbq;
+    SELECT * INTO {{ refresh_relation }} FROM {{ tmp_vw_relation }};
+  {%- endcall %}
+
+  {% call statement('dml_refresh_drop_view') -%}
+    DROP VIEW IF EXISTS {{ tmp_vw_relation.include(database=False) }};
   {%- endcall %}
 
   {# Compare schemas: if columns differ, fall back to rename-swap #}
