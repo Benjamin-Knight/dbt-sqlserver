@@ -24,7 +24,7 @@
       "Valid values are: 'rename' (default), 'dml'."
     ) }}
   {%- endif -%}
-  {%- set use_dml_refresh = (table_refresh_method == 'dml' and existing_relation is not none) -%}
+  {%- set use_dml_refresh = (table_refresh_method == 'dml' and existing_relation is not none and existing_relation.type == 'table') -%}
 
   -- drop the temp relations if they exist already in the database
   {{ drop_relation_if_exists(preexisting_intermediate_relation) }}

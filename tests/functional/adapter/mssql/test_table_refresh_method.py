@@ -91,6 +91,26 @@ dml_with_columnstore_v2_sql = """
 select 2 as id, 'world' as val
 """
 
+view_then_dml_table_sql = """
+{{
+  config({
+    "materialized": "view"
+  })
+}}
+select 1 as id, 'hello' as val
+"""
+
+view_then_dml_table_v2_sql = """
+{{
+  config({
+    "materialized": "table",
+    "table_refresh_method": "dml",
+    "as_columnstore": False
+  })
+}}
+select 2 as id, 'world' as val
+"""
+
 dml_contract_model_sql = """
 {{ config(materialized="table", table_refresh_method="dml", as_columnstore=False) }}
 select 1 as id, 'hello' as val
@@ -436,3 +456,44 @@ class TestDmlRefreshWithCTE:
 
         # Scratch table should be cleaned up
         assert not table_exists(project, "dml_cte_model__dbt_refresh")
+
+
+# -- Test: Existing view with DML refresh falls back to rename-swap --
+
+class TestDmlRefreshExistingViewFallback:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {"dml_view_model.sql": view_then_dml_table_sql}
+
+    def test_view_to_table_with_dml_config(self, project):
+        # First run — creates a view
+        results = run_dbt(["run"])
+        assert len(results) == 1
+        assert results[0].status == "success"
+
+        # Verify it's a view
+        sql = (
+            f"SELECT COUNT(*) FROM INFORMATION_SCHEMA.VIEWS "
+            f"WHERE TABLE_SCHEMA = '{project.test_schema}' "
+            f"AND TABLE_NAME = 'dml_view_model'"
+        )
+        with get_connection(project.adapter):
+            _, result = project.adapter.execute(sql, fetch=True)
+        assert result.rows[0][0] == 1
+
+        # Swap in v2 model that materializes as table with dml refresh
+        write_model(project, "dml_view_model.sql", view_then_dml_table_v2_sql)
+
+        # Second run — existing relation is a view, DML refresh should
+        # skip the DELETE+INSERT path and fall back to rename-swap
+        results = run_dbt(["run"])
+        assert len(results) == 1
+        assert results[0].status == "success"
+
+        # Verify it's now a table, not a view
+        assert table_exists(project, "dml_view_model")
+
+        rows = query_table(project, "dml_view_model")
+        assert len(rows) == 1
+        assert rows[0][0] == 2
+        assert rows[0][1] == "world"
