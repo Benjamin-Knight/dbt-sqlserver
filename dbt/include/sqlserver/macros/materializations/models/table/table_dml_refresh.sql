@@ -47,14 +47,20 @@
   {%- set schema_match = not schema_changes['schema_changed'] -%}
 
   {% if schema_match %}
+    {# Use the target's physical column order for both INSERT and SELECT. #}
+    {# The scratch table has the same columns but possibly in a different order, #}
+    {# so naming columns explicitly makes the swap order-independent. #}
+    {%- set target_columns = adapter.get_columns_in_relation(target_relation) -%}
+    {%- set column_list = target_columns | map(attribute='quoted') | join(', ') -%}
+
     {# Atomic DML swap — RCSI protects concurrent readers #}
     {# dbt-sqlserver uses autocommit=True and add_begin_query/add_commit_query #}
     {# are no-ops, so this creates a simple (non-nested) transaction. #}
     {% call statement('dml_refresh_swap') -%}
       BEGIN TRANSACTION;
       DELETE FROM {{ target_relation }};
-      INSERT INTO {{ target_relation }}
-        SELECT * FROM {{ refresh_relation }};
+      INSERT INTO {{ target_relation }} ({{ column_list }})
+        SELECT {{ column_list }} FROM {{ refresh_relation }};
       COMMIT TRANSACTION;
     {%- endcall %}
 
