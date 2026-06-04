@@ -32,14 +32,14 @@
         Trade-off (documented, no runtime warning): on Enterprise editions the
         rowstore load phase serializes on the B-tree insert and can be ~2x
         slower wall-clock than heap-then-parallel-index. -#}
-    {%- set use_prebuilt = full_refresh_build == 'prebuilt' and not temporary and not contract_enforced -%}
+    {%- set wants_prebuilt = full_refresh_build == 'prebuilt' and not temporary -%}
 
     {#- rowstore prebuilt needs a clustered entry in the indexes config to
         pre-create; without one there is nothing to prebuild, so warn and use
         the default heap path. validate_indexes guarantees at most one
         clustered entry and rejects clustered x as_columnstore conflicts. -#}
     {%- set prebuilt_ns = namespace(clustered_dict=none) -%}
-    {%- if use_prebuilt and not as_columnstore -%}
+    {%- if wants_prebuilt and not as_columnstore -%}
         {%- for raw_index in config.get('indexes', default=[]) -%}
             {%- set parsed = adapter.parse_index(raw_index) -%}
             {%- if parsed and parsed.type == 'clustered' and prebuilt_ns.clustered_dict is none -%}
@@ -48,12 +48,20 @@
         {%- endfor -%}
         {%- if prebuilt_ns.clustered_dict is none -%}
             {{ log("full_refresh_build=prebuilt on " ~ this ~ " requires a clustered index in the indexes config; falling back to heap_then_index", info=true) }}
-            {%- set use_prebuilt = false -%}
+            {%- set wants_prebuilt = false -%}
         {%- endif -%}
     {%- endif -%}
 
-    {% if use_prebuilt %}
+    {#- contract-enforced models already create an empty DDL table + TABLOCK
+        insert; prebuilt there just adds the clustered design between the two
+        (handled inside the contract branch below). -#}
+    {%- set use_prebuilt = wants_prebuilt and not contract_enforced -%}
+    {%- set contract_prebuilt = wants_prebuilt and contract_enforced -%}
+    {%- if wants_prebuilt -%}
         {{ log("Building " ~ this ~ " with full_refresh_build=prebuilt", info=true) }}
+    {%- endif -%}
+
+    {% if use_prebuilt %}
         EXEC('SELECT TOP 0 * INTO {{ table_name }} FROM {{ tmp_relation }}')
 
         {% if as_columnstore %}
@@ -75,6 +83,15 @@
                 CREATE TABLE {{table_name}}
                 {{ get_assert_columns_equivalent(sql)  }}
                 {{ build_columns_constraints(relation) }}
+                {% if contract_prebuilt %}
+                    {#- apply the clustered design to the empty DDL table so
+                        the TABLOCK insert below loads it prebuilt -#}
+                    {% if as_columnstore %}
+                        {{ sqlserver__create_clustered_columnstore_index(relation, name_relation=this) }}
+                    {% else %}
+                        {{ sqlserver__get_create_index_sql(relation, prebuilt_ns.clustered_dict, name_relation=this) }}
+                    {% endif %}
+                {% endif %}
                 {% set listColumns %}
                     {% for column in model['columns'] %}
                         {{ "["~column~"]" }}{{ ", " if not loop.last }}
@@ -93,11 +110,12 @@
         {# For some reason drop_relation is not firing. This solves the issue for now. #}
         EXEC('DROP VIEW IF EXISTS {{ tmp_relation.include(database=False) }}')
 
-        {% if not temporary and as_columnstore -%}
+        {% if not temporary and as_columnstore and not contract_prebuilt -%}
             {#-
             add columnstore index
             this creates with dbt_temp as its coming from a temporary relation before renaming
             could alter relation to drop the dbt_temp portion if needed
+            (contract_prebuilt already created the CCI before the insert)
             -#}
             {{ sqlserver__create_clustered_columnstore_index(relation) }}
         {% endif %}

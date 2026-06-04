@@ -210,3 +210,127 @@ class TestFullRefreshBuildRowstore:
             ["run", "--models", "prebuilt_default_cci_clustered"], expect_pass=False
         )
         assert "as_columnstore" in output
+
+
+models__incr_prebuilt_sql = """
+{{
+  config(
+    materialized = "incremental",
+    as_columnstore = False,
+    full_refresh_build = "prebuilt",
+    indexes=[
+      {'columns': ['column_a'], 'type': 'clustered'},
+    ]
+  )
+}}
+
+select *
+from (
+  select 1 as column_a, 2 as column_b
+) t
+
+{% if is_incremental() %}
+    where column_a > (select max(column_a) from {{this}})
+{% endif %}
+
+"""
+
+models__contract_prebuilt_sql = """
+{{
+  config(
+    materialized = "table",
+    as_columnstore = False,
+    full_refresh_build = "prebuilt",
+    contract = {"enforced": True},
+    indexes=[
+      {'columns': ['column_a'], 'type': 'clustered'},
+    ]
+  )
+}}
+
+select 1 as column_a, cast('x' as varchar(10)) as column_b
+
+"""
+
+models__contract_prebuilt_yml = """
+version: 2
+models:
+  - name: contract_prebuilt
+    config:
+      contract:
+        enforced: true
+    columns:
+      - name: column_a
+        data_type: int
+      - name: column_b
+        data_type: varchar(10)
+"""
+
+models__dml_prebuilt_sql = """
+{{
+  config(
+    materialized = "table",
+    as_columnstore = False,
+    table_refresh_method = "dml",
+    full_refresh_build = "prebuilt",
+    indexes=[
+      {'columns': ['column_a'], 'type': 'clustered'},
+    ]
+  )
+}}
+
+select 1 as column_a, 2 as column_b
+
+"""
+
+
+class TestFullRefreshBuildIncrementalAndContract:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "incr_prebuilt.sql": models__incr_prebuilt_sql,
+            "contract_prebuilt.sql": models__contract_prebuilt_sql,
+            "contract_prebuilt.yml": models__contract_prebuilt_yml,
+            "dml_prebuilt.sql": models__dml_prebuilt_sql,
+        }
+
+    def test_incremental_lifecycle(self, project, unique_schema):
+        # First build: direct on target, prebuilt applies.
+        _, output = run_dbt_and_capture(["run", "--models", "incr_prebuilt"])
+        assert "full_refresh_build=prebuilt" in output
+        first = get_rowstore_indexes(project, unique_schema, "incr_prebuilt")
+        assert set(first) == {"CLUSTERED"}
+        assert first["CLUSTERED"][0].startswith("dbt_idx_")
+
+        # Plain incremental run: the temp relation build must NOT take the
+        # prebuilt path (temporary=True bypass); reconcile leaves the index.
+        _, output = run_dbt_and_capture(["run", "--models", "incr_prebuilt"])
+        assert "full_refresh_build=prebuilt" not in output
+        assert get_rowstore_indexes(project, unique_schema, "incr_prebuilt") == first
+
+        # Full refresh: rebuild via intermediate->swap, stable name.
+        _, output = run_dbt_and_capture(["run", "--models", "incr_prebuilt", "--full-refresh"])
+        assert "full_refresh_build=prebuilt" in output
+        assert get_rowstore_indexes(project, unique_schema, "incr_prebuilt") == first
+
+    def test_contract_enforced_prebuilt(self, project, unique_schema):
+        _, output = run_dbt_and_capture(["run", "--models", "contract_prebuilt"])
+        assert "full_refresh_build=prebuilt" in output
+        by_type = get_rowstore_indexes(project, unique_schema, "contract_prebuilt")
+        assert set(by_type) == {"CLUSTERED"}
+        assert by_type["CLUSTERED"][0].startswith("dbt_idx_")
+
+        # stable on rerun
+        run_dbt(["run", "--models", "contract_prebuilt"])
+        assert get_rowstore_indexes(project, unique_schema, "contract_prebuilt") == by_type
+
+    def test_dml_refresh_ignores_prebuilt(self, project, unique_schema):
+        # table_refresh_method=dml builds its scratch via its own SELECT INTO,
+        # not create_table_as: prebuilt is out of scope there by design. First
+        # build goes through create_table_as (rename path) and DOES prebuild;
+        # the second, pure-DML run must not.
+        run_dbt(["run", "--models", "dml_prebuilt"])
+        _, output = run_dbt_and_capture(["run", "--models", "dml_prebuilt"])
+        assert "full_refresh_build=prebuilt" not in output
+        by_type = get_rowstore_indexes(project, unique_schema, "dml_prebuilt")
+        assert set(by_type) == {"CLUSTERED"}
