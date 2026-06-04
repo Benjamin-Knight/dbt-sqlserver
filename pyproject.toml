@@ -54,6 +54,7 @@ dev = [
     "mypy==1.11.2",
     "pre-commit",
     "pytest",
+    "pytest-cov",
     "pytest-csv",
     "pytest-dotenv",
     "pytest-xdist",
