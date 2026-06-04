@@ -1,5 +1,12 @@
 {% macro sqlserver__create_table_as(temporary, relation, sql) -%}
     {%- set query_label = get_query_options(parse_options=True) -%}
+    {%- set full_refresh_build = config.get('full_refresh_build', 'heap_then_index') -%}
+    {%- if full_refresh_build not in ['heap_then_index', 'prebuilt'] -%}
+      {{ exceptions.raise_compiler_error(
+        "Invalid full_refresh_build '" ~ full_refresh_build ~ "'. "
+        "Valid values are: 'heap_then_index' (default), 'prebuilt'."
+      ) }}
+    {%- endif -%}
     {%- set tmp_relation = relation.incorporate(path={"identifier": relation.identifier ~ '__dbt_tmp_vw'}, type='view') -%}
 
     {%- do adapter.drop_relation(tmp_relation) -%}
