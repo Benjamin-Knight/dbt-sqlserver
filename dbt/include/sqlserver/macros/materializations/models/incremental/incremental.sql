@@ -34,8 +34,19 @@
   {% if existing_relation is none %}
       {% set build_sql = get_create_table_as_sql(False, target_relation, sql) %}
   {% elif full_refresh_mode %}
+    {% if config.get('full_refresh_build', 'heap_then_index') == 'prebuilt' %}
+      {#- In-place full refresh: drop the old table first (freeing its space),
+          then rebuild the target directly - no intermediate, no swap, ~1x
+          peak disk. The target is empty/loading during the rebuild and a
+          failure leaves an empty/partial table; recovery is rerunning with
+          --full-refresh. Only the explicit full-refresh path does this:
+          first builds and normal incremental runs keep the default path. -#}
+      {% do adapter.drop_relation(existing_relation) %}
+      {% set build_sql = sqlserver__create_table_as_prebuilt(target_relation, sql) %}
+    {% else %}
       {% set build_sql = get_create_table_as_sql(False, intermediate_relation, sql) %}
       {% set need_swap = true %}
+    {% endif %}
   {% else %}
 
     {% do run_query(get_create_table_as_sql(True, temp_relation, sql)) %}

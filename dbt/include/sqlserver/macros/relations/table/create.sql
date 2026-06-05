@@ -19,118 +19,135 @@
 
 
     {%- set contract_config = config.get('contract') -%}
-    {%- set as_columnstore = config.get('as_columnstore', default=true) -%}
-    {%- set contract_enforced = contract_config.enforced and (not temporary) -%}
-    {#- prebuilt: create the relation EMPTY with its clustered design already in
-        place, then bulk-load with TABLOCK. Avoids the uncompressed-heap stage
-        (peak disk = heap + index-build sort) of the default path; on an empty
-        clustered target the TABLOCK insert is minimally logged under
-        SIMPLE/bulk-logged recovery and rows compress on insert. The index is
-        created on this (possibly intermediate) relation but NAMED for `this`
-        (the final target) so the name survives the rename swap and the
-        post-swap create_indexes/reconcile see the expected name.
-        Trade-off (documented, no runtime warning): on Enterprise editions the
-        rowstore load phase serializes on the B-tree insert and can be ~2x
-        slower wall-clock than heap-then-parallel-index. -#}
-    {#- prebuilt only applies when building into an intermediate relation that
-        will be rename-swapped over the target (table materialization,
-        incremental/snapshot full refresh). Direct-on-target builds (e.g.
-        incremental first build) keep the atomic SELECT INTO: prebuilt there
-        would commit an empty, visible target before loading it, and a
-        mid-load failure would leave that empty table for the next run to
-        treat as already built. -#}
-    {%- set building_intermediate = this is not none and relation.render() != this.render() -%}
-    {%- set wants_prebuilt = full_refresh_build == 'prebuilt' and not temporary and building_intermediate -%}
+    {%- set query -%}
+        {% if contract_config.enforced and (not temporary) %}
+            CREATE TABLE {{table_name}}
+            {{ get_assert_columns_equivalent(sql)  }}
+            {{ build_columns_constraints(relation) }}
+            {% set listColumns %}
+                {% for column in model['columns'] %}
+                    {{ "["~column~"]" }}{{ ", " if not loop.last }}
+                {% endfor %}
+            {%endset%}
+            INSERT INTO {{relation}} WITH (TABLOCK) ({{listColumns}})
+            SELECT {{listColumns}} FROM {{tmp_relation}} {{ query_label }}
 
-    {#- rowstore prebuilt needs a clustered entry in the indexes config to
-        pre-create; without one there is nothing to prebuild, so warn and use
-        the default heap path. validate_indexes guarantees at most one
-        clustered entry and rejects clustered x as_columnstore conflicts. -#}
+        {% else %}
+            SELECT * INTO {{ table_name }} FROM {{ tmp_relation }} {{ query_label }}
+        {% endif %}
+    {%- endset -%}
+
+    EXEC('{{- escape_single_quotes(query) -}}')
+
+    {# For some reason drop_relation is not firing. This solves the issue for now. #}
+    EXEC('DROP VIEW IF EXISTS {{ tmp_relation.include(database=False) }}')
+
+
+
+    {% set as_columnstore = config.get('as_columnstore', default=true) %}
+    {% if not temporary and as_columnstore -%}
+        {#-
+        add columnstore index
+        this creates with dbt_temp as its coming from a temporary relation before renaming
+        could alter relation to drop the dbt_temp portion if needed
+        -#}
+        {{ sqlserver__create_clustered_columnstore_index(relation) }}
+   {% endif %}
+
+{% endmacro %}
+
+
+{% macro sqlserver__create_table_as_prebuilt(relation, sql) -%}
+    {#-
+      In-place rebuild for full_refresh_build=prebuilt. Called by the
+      materializations on full-refresh paths AFTER they have dropped the
+      existing target: the table is created EMPTY directly under its final
+      name with its clustered design in place (the as_columnstore CCI or the
+      clustered entry from the indexes config), then bulk-loaded with
+      INSERT WITH (TABLOCK).
+
+      Compared to the default build-intermediate-and-swap, this never holds
+      two copies of the data, so peak disk is ~1x instead of 2x plus the
+      uncompressed-heap overshoot. The trade-offs, by design:
+        - the target is empty/loading while the rebuild runs (readers under
+          RCSI see an empty table rather than the previous data);
+        - there is no backup copy: a failed rebuild leaves an empty or
+          partial table, and recovery is rerunning with --full-refresh.
+      The TABLOCK insert into the empty clustered target is minimally logged
+      under SIMPLE/bulk-logged recovery; rowstore compresses on insert and
+      columnstore loads parallel direct-to-compressed (batches under
+      ~102,400 rows/thread land in delta rowgroups).
+      Enterprise note (documented, no runtime warning): the rowstore load
+      serializes on the B-tree insert and can be ~2x slower wall-clock than
+      heap-then-parallel-index.
+    -#}
+    {%- set query_label = get_query_options(parse_options=True) -%}
+    {%- set as_columnstore = config.get('as_columnstore', default=true) -%}
+    {%- set contract_config = config.get('contract') -%}
+    {%- set contract_enforced = contract_config.enforced -%}
+    {%- set tmp_relation = relation.incorporate(path={"identifier": relation.identifier ~ '__dbt_tmp_vw'}, type='view') -%}
+
+    {#- rowstore prebuilt needs a clustered entry in the indexes config;
+        without one there is nothing to prebuild and the plain SELECT INTO
+        below is an equivalent bulk heap load, so this is a debug-level
+        trace, not a console warning (a table model would emit it on every
+        run). validate_indexes guarantees at most one clustered entry and
+        rejects clustered x as_columnstore conflicts. -#}
     {%- set prebuilt_ns = namespace(clustered_dict=none) -%}
-    {%- if wants_prebuilt and not as_columnstore -%}
+    {%- if not as_columnstore -%}
         {%- for raw_index in config.get('indexes', default=[]) -%}
             {%- set parsed = adapter.parse_index(raw_index) -%}
             {%- if parsed and parsed.type == 'clustered' and prebuilt_ns.clustered_dict is none -%}
                 {%- set prebuilt_ns.clustered_dict = raw_index -%}
             {%- endif -%}
         {%- endfor -%}
-        {%- if prebuilt_ns.clustered_dict is none -%}
-            {#- nothing to prebuild without a clustered design; the default
-                SELECT INTO heap load is an equivalent bulk path, so this is a
-                debug-level trace, not a console warning (a table model would
-                emit it on every run) -#}
-            {% do log("full_refresh_build=prebuilt on " ~ this ~ " has no clustered index in the indexes config; using the default heap build") %}
-            {%- set wants_prebuilt = false -%}
-        {%- endif -%}
+    {%- endif -%}
+    {%- set has_clustered_design = as_columnstore or prebuilt_ns.clustered_dict is not none -%}
+    {%- if has_clustered_design -%}
+        {{ log("Rebuilding " ~ relation ~ " in place with full_refresh_build=prebuilt", info=true) }}
+    {%- else -%}
+        {% do log("full_refresh_build=prebuilt on " ~ relation ~ " has no clustered index in the indexes config; loading in place as a heap") %}
     {%- endif -%}
 
-    {#- contract-enforced models already create an empty DDL table + TABLOCK
-        insert; prebuilt there just adds the clustered design between the two
-        (handled inside the contract branch below). -#}
-    {%- set use_prebuilt = wants_prebuilt and not contract_enforced -%}
-    {%- set contract_prebuilt = wants_prebuilt and contract_enforced -%}
-    {%- if wants_prebuilt -%}
-        {{ log("Building " ~ this ~ " with full_refresh_build=prebuilt", info=true) }}
-    {%- endif -%}
+    {%- do adapter.drop_relation(tmp_relation) -%}
+    USE [{{ relation.database }}];
+    {{ get_create_view_as_sql(tmp_relation, sql) }}
 
-    {% if use_prebuilt %}
-        EXEC('SELECT TOP 0 * INTO {{ table_name }} FROM {{ tmp_relation }}')
-
-        {% if as_columnstore %}
-            {{ sqlserver__create_clustered_columnstore_index(relation, name_relation=this) }}
-        {% else %}
-            {{ sqlserver__get_create_index_sql(relation, prebuilt_ns.clustered_dict, name_relation=this) }}
-        {% endif %}
-
-        {%- set insert_query -%}
-            INSERT INTO {{ table_name }} WITH (TABLOCK)
-            SELECT * FROM {{ tmp_relation }} {{ query_label }}
-        {%- endset %}
-        EXEC('{{- escape_single_quotes(insert_query) -}}')
-
-        EXEC('DROP VIEW IF EXISTS {{ tmp_relation.include(database=False) }}')
-    {% else %}
-        {%- set query -%}
-            {% if contract_enforced %}
-                CREATE TABLE {{table_name}}
-                {{ get_assert_columns_equivalent(sql)  }}
-                {{ build_columns_constraints(relation) }}
-                {% if contract_prebuilt %}
-                    {#- apply the clustered design to the empty DDL table so
-                        the TABLOCK insert below loads it prebuilt -#}
-                    {% if as_columnstore %}
-                        {{ sqlserver__create_clustered_columnstore_index(relation, name_relation=this) }}
-                    {% else %}
-                        {{ sqlserver__get_create_index_sql(relation, prebuilt_ns.clustered_dict, name_relation=this) }}
-                    {% endif %}
-                {% endif %}
-                {% set listColumns %}
-                    {% for column in model['columns'] %}
-                        {{ "["~column~"]" }}{{ ", " if not loop.last }}
-                    {% endfor %}
-                {%endset%}
-                INSERT INTO {{relation}} WITH (TABLOCK) ({{listColumns}})
-                SELECT {{listColumns}} FROM {{tmp_relation}} {{ query_label }}
-
-            {% else %}
-                SELECT * INTO {{ table_name }} FROM {{ tmp_relation }} {{ query_label }}
-            {% endif %}
+    {% if contract_enforced %}
+        {%- set ddl_query -%}
+            CREATE TABLE {{ relation }}
+            {{ get_assert_columns_equivalent(sql)  }}
+            {{ build_columns_constraints(relation) }}
         {%- endset -%}
-
-        EXEC('{{- escape_single_quotes(query) -}}')
-
-        {# For some reason drop_relation is not firing. This solves the issue for now. #}
-        EXEC('DROP VIEW IF EXISTS {{ tmp_relation.include(database=False) }}')
-
-        {% if not temporary and as_columnstore and not contract_prebuilt -%}
-            {#-
-            add columnstore index
-            this creates with dbt_temp as its coming from a temporary relation before renaming
-            could alter relation to drop the dbt_temp portion if needed
-            (contract_prebuilt already created the CCI before the insert)
-            -#}
-            {{ sqlserver__create_clustered_columnstore_index(relation) }}
-        {% endif %}
+        EXEC('{{- escape_single_quotes(ddl_query) -}}')
+    {% else %}
+        EXEC('SELECT TOP 0 * INTO {{ relation }} FROM {{ tmp_relation }}')
     {% endif %}
+
+    {% if as_columnstore %}
+        {{ sqlserver__create_clustered_columnstore_index(relation) }}
+    {% elif prebuilt_ns.clustered_dict is not none %}
+        {{ sqlserver__get_create_index_sql(relation, prebuilt_ns.clustered_dict) }}
+    {% endif %}
+
+    {%- if contract_enforced -%}
+        {%- set listColumns -%}
+            {%- for column in model['columns'] -%}
+                {{ "["~column~"]" }}{{ ", " if not loop.last }}
+            {%- endfor -%}
+        {%- endset -%}
+        {%- set insert_query -%}
+            INSERT INTO {{ relation }} WITH (TABLOCK) ({{ listColumns }})
+            SELECT {{ listColumns }} FROM {{ tmp_relation }} {{ query_label }}
+        {%- endset -%}
+    {%- else -%}
+        {%- set insert_query -%}
+            INSERT INTO {{ relation }} WITH (TABLOCK)
+            SELECT * FROM {{ tmp_relation }} {{ query_label }}
+        {%- endset -%}
+    {%- endif %}
+    EXEC('{{- escape_single_quotes(insert_query) -}}')
+
+    EXEC('DROP VIEW IF EXISTS {{ tmp_relation.include(database=False) }}')
 
 {% endmacro %}

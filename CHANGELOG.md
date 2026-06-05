@@ -10,8 +10,8 @@
 - Add `drop_unmanaged_indexes` config (`false` (default) / `warn` / `true`) for indexes dbt didn't create.
 - Validate cross-index config conflicts (multiple clustered indexes, clustered vs `as_columnstore`).
 - Document the minimum supported SQL Server version (2017). Partitioning, `XML_COMPRESSION` and ordered columnstore are not yet expressible in the `indexes` config.
-- Add `full_refresh_build` model config: `prebuilt` creates the new table empty with its clustered design in place (the `as_columnstore` CCI, or the clustered index from `indexes`), then loads via `INSERT WITH (TABLOCK)`, avoiding the uncompressed-heap stage and cutting peak rebuild disk. Default `heap_then_index` is unchanged.
-- `prebuilt` only applies when building into the intermediate relation that is rename-swapped over the target (table materializations and `--full-refresh` rebuilds); the intermediate exists empty/loading during the build but the live target is never empty. Direct-on-target builds (e.g. incremental first build), rowstore models without a clustered index, and DML table refresh all keep the default build path.
+- Add `full_refresh_build` model config: `prebuilt` rebuilds the table in place - drop the old table, recreate it empty with its clustered design (the `as_columnstore` CCI or the clustered index from `indexes`), then bulk-load via `INSERT WITH (TABLOCK)`. No intermediate copy or rename swap, so peak rebuild disk is ~1x instead of 2x plus the uncompressed-heap overshoot. Default `heap_then_index` is unchanged.
+- `prebuilt` trade-off, by design: the target is empty/loading while the rebuild runs and there is no backup copy - a failed rebuild leaves an empty or partial table (recovery: rerun with `--full-refresh`). It applies to table materializations (every run is a rebuild) and incremental `--full-refresh` only; first builds, normal incremental runs and DML table refresh keep the default path. Rowstore models without a clustered index in `indexes` load in place as a heap.
 
 ### v1.10.0
 

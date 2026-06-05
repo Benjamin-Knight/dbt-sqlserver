@@ -39,8 +39,29 @@
   -- `BEGIN` happens here:
   {{ run_hooks(pre_hooks, inside_transaction=True) }}
 
+  {%- set full_refresh_build = config.get('full_refresh_build', 'heap_then_index') -%}
+
   {% if use_dml_refresh %}
     {{ sqlserver__table_dml_refresh(target_relation, sql) }}
+  {% elif full_refresh_build == 'prebuilt' %}
+    {#- In-place rebuild: drop the old table FIRST (freeing its space), then
+        create the target empty with its clustered design and bulk-load it.
+        No intermediate, no backup, no swap - peak disk is ~1x instead of 2x.
+        The target is empty/loading for the duration of the build, and a
+        failed build leaves an empty or partial table (recovery: rerun).
+        This is the documented trade-off of opting into prebuilt. -#}
+    {% if existing_relation is not none %}
+      {% set existing_relation = load_cached_relation(existing_relation) %}
+      {% if existing_relation is not none %}
+        {{ adapter.drop_relation(existing_relation) }}
+      {% endif %}
+    {% endif %}
+
+    {% call statement('main') -%}
+      {{ sqlserver__create_table_as_prebuilt(target_relation, sql) }}
+    {%- endcall %}
+
+    {% do create_indexes(target_relation) %}
   {% else %}
     -- build model
     {% call statement('main') -%}
