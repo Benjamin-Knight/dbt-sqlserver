@@ -104,9 +104,8 @@
         EXEC('SELECT TOP 0 * INTO {{ relation }} FROM {{ tmp_relation }}')
     {% endif %}
 
-    {# mark the rebuild in progress; removed atomically with the load below.
-       Normal incremental runs refuse to append while the marker is present. #}
-    EXEC sp_addextendedproperty @name = N'dbt_prebuilt_incomplete', @value = '1',
+    {# mark the rebuild in progress; removed atomically with the load below #}
+    EXEC sp_addextendedproperty @name = N'dbt_full_refresh_incomplete', @value = '1',
         @level0type = N'SCHEMA', @level0name = N'{{ relation.schema }}',
         @level1type = N'TABLE', @level1name = N'{{ relation.identifier }}'
 
@@ -137,7 +136,7 @@
         SET XACT_ABORT ON;
         BEGIN TRANSACTION;
         {{ insert_statement }};
-        EXEC sp_dropextendedproperty @name = N'dbt_prebuilt_incomplete',
+        EXEC sp_dropextendedproperty @name = N'dbt_full_refresh_incomplete',
             @level0type = N'SCHEMA', @level0name = N'{{ relation.schema }}',
             @level1type = N'TABLE', @level1name = N'{{ relation.identifier }}';
         COMMIT TRANSACTION;
@@ -147,3 +146,34 @@
     EXEC('DROP VIEW IF EXISTS {{ tmp_relation.include(database=False) }}')
 
 {% endmacro %}
+
+
+{% macro sqlserver__mark_full_refresh_incomplete(relation) -%}
+    {#- mark a table as having a full refresh in flight; the marker rides the
+        object, so a successful swap (old table dropped) or in-place rebuild
+        (table dropped) clears it naturally -#}
+    {% do run_query(
+        "if not exists (select 1 from sys.extended_properties where major_id = OBJECT_ID('"
+        ~ relation.schema ~ "." ~ relation.identifier
+        ~ "') and name = 'dbt_full_refresh_incomplete')"
+        ~ " EXEC sp_addextendedproperty @name = N'dbt_full_refresh_incomplete', @value = '1',"
+        ~ " @level0type = N'SCHEMA', @level0name = N'" ~ relation.schema ~ "',"
+        ~ " @level1type = N'TABLE', @level1name = N'" ~ relation.identifier ~ "'"
+    ) %}
+{%- endmacro %}
+
+
+{% macro sqlserver__assert_no_incomplete_full_refresh(relation) -%}
+    {%- set marker = run_query(
+        "select count(*) as marker_count from sys.extended_properties where major_id = OBJECT_ID('"
+        ~ relation.schema ~ "." ~ relation.identifier
+        ~ "') and name = 'dbt_full_refresh_incomplete'"
+    ) -%}
+    {%- if marker.rows[0][0] > 0 -%}
+        {{ exceptions.raise_compiler_error(
+            "A previous full refresh of " ~ relation
+            ~ " did not complete; the table may be stale, empty or partially "
+            "loaded. Rerun with --full-refresh."
+        ) }}
+    {%- endif -%}
+{%- endmacro %}

@@ -414,7 +414,7 @@ class TestFullRefreshBuildSafety:
         # Simulate a prebuilt rebuild that died mid-load: empty table carrying
         # the in-progress marker.
         project.run_sql(f"truncate table {unique_schema}.guard_model")
-        project.run_sql(f"""EXEC sp_addextendedproperty @name = N'dbt_prebuilt_incomplete',
+        project.run_sql(f"""EXEC sp_addextendedproperty @name = N'dbt_full_refresh_incomplete',
                 @value = '1', @level0type = N'SCHEMA',
                 @level0name = '{unique_schema}',
                 @level1type = N'TABLE', @level1name = 'guard_model'""")
@@ -430,7 +430,96 @@ class TestFullRefreshBuildSafety:
         marker = project.run_sql(
             f"""select count(*) from sys.extended_properties
                 where major_id = OBJECT_ID('{unique_schema}.guard_model')
-                and name = 'dbt_prebuilt_incomplete'""",
+                and name = 'dbt_full_refresh_incomplete'""",
             fetch="one",
         )
         assert marker[0] == 0
+
+
+models__swap_guard_sql = """
+{{
+  config(
+    materialized = "incremental",
+    as_columnstore = False
+  )
+}}
+
+select 1 as column_a {% if var('break_model', false) %}, 1/0 as boom {% endif %}
+
+"""
+
+
+class TestFullRefreshBuildSwapGuard:
+    """The incomplete-rebuild marker also protects DEFAULT (swap) full
+    refreshes: a rebuild that dies mid-intermediate-build must block normal
+    incremental runs instead of silently appending onto the stale table."""
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "guard_model.sql": models__guard_model_sql,
+            "swap_guard.sql": models__swap_guard_sql,
+        }
+
+    def count(self, project, unique_schema, table):
+        return project.run_sql(f"select count(*) from {unique_schema}.{table}", fetch="one")[0]
+
+    def marker_count(self, project, unique_schema, table):
+        return project.run_sql(
+            f"""select count(*) from sys.extended_properties
+                where major_id = OBJECT_ID('{unique_schema}.{table}')
+                and name = 'dbt_full_refresh_incomplete'""",
+            fetch="one",
+        )[0]
+
+    def test_failed_swap_full_refresh_blocks_normal_runs(self, project, unique_schema):
+        run_dbt(["run", "--models", "swap_guard"])
+        project.run_sql(f"insert into {unique_schema}.swap_guard values (99)")
+        assert self.count(project, unique_schema, "swap_guard") == 2
+
+        # full refresh dies mid-intermediate-build (runtime divide-by-zero):
+        # old table stays live but is now marked incomplete
+        run_dbt_and_capture(
+            ["run", "--models", "swap_guard", "--full-refresh", "--vars", "break_model: true"],
+            expect_pass=False,
+        )
+        assert self.count(project, unique_schema, "swap_guard") == 2
+        assert self.marker_count(project, unique_schema, "swap_guard") == 1
+
+        # a normal run must ERROR, not append onto the stale table
+        _, output = run_dbt_and_capture(["run", "--models", "swap_guard"], expect_pass=False)
+        assert "did not complete" in output
+        assert self.count(project, unique_schema, "swap_guard") == 2
+
+        # a successful full refresh recovers; the marker leaves with the
+        # old table when it is swapped out
+        run_dbt(["run", "--models", "swap_guard", "--full-refresh"])
+        assert self.count(project, unique_schema, "swap_guard") == 1
+        assert self.marker_count(project, unique_schema, "swap_guard") == 0
+
+    def test_real_failure_during_prebuilt_rebuild_sets_marker(self, project, unique_schema):
+        run_dbt(["run", "--models", "guard_model"])
+
+        # an index on a column the model doesn't produce passes config
+        # validation but fails at the engine AFTER the drop: the marker on
+        # the new empty table must be present
+        bad = "[{'columns': ['no_such_column'], 'type': 'clustered'}]"
+        run_dbt_and_capture(
+            [
+                "run",
+                "--models",
+                "guard_model",
+                "--full-refresh",
+                "--vars",
+                f"guard_indexes: {bad}",
+            ],
+            expect_pass=False,
+        )
+        assert self.marker_count(project, unique_schema, "guard_model") == 1
+
+        _, output = run_dbt_and_capture(["run", "--models", "guard_model"], expect_pass=False)
+        assert "did not complete" in output
+
+        run_dbt(["run", "--models", "guard_model", "--full-refresh"])
+        assert self.count(project, unique_schema, "guard_model") == 1
+        assert self.marker_count(project, unique_schema, "guard_model") == 0
