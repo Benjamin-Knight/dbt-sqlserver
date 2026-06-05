@@ -47,6 +47,7 @@
       {#- in-place full refresh: drop the existing table, rebuild the target
           directly with no intermediate or swap (explicit --full-refresh
           only; view->table conversions keep the default path) -#}
+      {% do sqlserver__assert_no_unguarded_self_reference(target_relation, sql) %}
       {#- validate the index config BEFORE marking or dropping anything -#}
       {% do adapter.validate_indexes(
           config.get('indexes', default=[]),

@@ -177,3 +177,18 @@
         ) }}
     {%- endif -%}
 {%- endmacro %}
+
+
+{% macro sqlserver__assert_no_unguarded_self_reference(relation, compiled_sql) -%}
+    {#- a self-reference that survives full-refresh compilation (where
+        is_incremental() is false) would run against a table prebuilt has
+        already dropped: fail fast while the data is intact -#}
+    {%- if relation.render() | lower in compiled_sql | lower -%}
+        {{ exceptions.raise_compiler_error(
+            "Model " ~ relation ~ " contains an unguarded self-reference "
+            "({{ this }}) and full_refresh_build=prebuilt drops the table "
+            "before rebuilding. Guard the reference with is_incremental(), "
+            "or keep the default heap_then_index."
+        ) }}
+    {%- endif -%}
+{%- endmacro %}

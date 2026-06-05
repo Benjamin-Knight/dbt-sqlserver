@@ -531,3 +531,45 @@ class TestFullRefreshBuildSwapGuard:
         run_dbt(["run", "--models", "guard_model", "--full-refresh"])
         assert self.count(project, unique_schema, "guard_model") == 1
         assert self.marker_count(project, unique_schema, "guard_model") == 0
+
+
+models__selfref_model_sql = """
+{{
+  config(
+    materialized = "incremental",
+    as_columnstore = False,
+    full_refresh_build = "prebuilt",
+    indexes = [{'columns': ['column_a'], 'type': 'clustered'}]
+  )
+}}
+
+select 1 as column_a
+{% if var('selfref', false) %}
+union all
+select column_a from {{ this }} where 1 = 0
+{% endif %}
+
+"""
+
+
+class TestFullRefreshBuildSelfReference:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {"selfref_model.sql": models__selfref_model_sql}
+
+    def test_unguarded_self_reference_fails_before_drop(self, project, unique_schema):
+        run_dbt(["run", "--models", "selfref_model"])
+        project.run_sql(f"insert into {unique_schema}.selfref_model values (99)")
+
+        # an unguarded {{ this }} must fail fast: BEFORE the drop (data
+        # intact) and BEFORE the marker (normal runs not poisoned)
+        _, output = run_dbt_and_capture(
+            ["run", "--models", "selfref_model", "--full-refresh", "--vars", "selfref: true"],
+            expect_pass=False,
+        )
+        assert "self-reference" in output
+        rows = project.run_sql(f"select count(*) from {unique_schema}.selfref_model", fetch="one")
+        assert rows[0] == 2
+
+        # no marker was set, so a normal run still works
+        run_dbt(["run", "--models", "selfref_model"])

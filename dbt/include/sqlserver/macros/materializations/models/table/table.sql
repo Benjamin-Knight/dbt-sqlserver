@@ -52,6 +52,9 @@
   {% elif use_prebuilt %}
     {#- in-place rebuild: drop the existing table, then build the target
         directly with no intermediate or swap -#}
+    {% if existing_relation is not none %}
+      {% do sqlserver__assert_no_unguarded_self_reference(target_relation, sql) %}
+    {% endif %}
     {#- validate the index config BEFORE dropping anything -#}
     {% do adapter.validate_indexes(
         config.get('indexes', default=[]),
