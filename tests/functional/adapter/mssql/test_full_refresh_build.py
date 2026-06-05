@@ -337,19 +337,27 @@ class TestFullRefreshBuildIncrementalAndContract:
         _, output = run_dbt_and_capture(["run", "--models", "contract_prebuilt"])
         assert "full_refresh_build=prebuilt" not in output
 
-    def test_dml_refresh_ignores_prebuilt(self, project, unique_schema):
+    def test_dml_refresh_prebuilt_on_rebuild_boundaries(self, project, unique_schema):
         # first build: prebuilt applies (opted in, indices from birth);
-        # dml refreshes thereafter never swap, so prebuilt never applies
+        # dml governs only the steady-state refreshes in between
         _, output = run_dbt_and_capture(["run", "--models", "dml_prebuilt"])
         assert "full_refresh_build=prebuilt" in output
         _, output = run_dbt_and_capture(["run", "--models", "dml_prebuilt"])
         assert "full_refresh_build=prebuilt" not in output
         by_type = get_rowstore_indexes(project, unique_schema, "dml_prebuilt")
         assert set(by_type) == {"CLUSTERED"}
+        first_name = by_type["CLUSTERED"][0]
 
-        # dml takes precedence even under --full-refresh
+        # --full-refresh is a rebuild boundary: prebuilt wins over dml,
+        # the table is dropped and rebuilt in place (a fully-logged
+        # whole-table DELETE+INSERT is the wrong tool for a rebuild)
         _, output = run_dbt_and_capture(["run", "--models", "dml_prebuilt", "--full-refresh"])
-        assert "full_refresh_build=prebuilt" not in output
+        assert "full_refresh_build=prebuilt" in output
+        by_type = get_rowstore_indexes(project, unique_schema, "dml_prebuilt")
+        assert set(by_type) == {"CLUSTERED"}
+        assert by_type["CLUSTERED"][0] == first_name
+        rows = project.run_sql(f"select count(*) from {unique_schema}.dml_prebuilt", fetch="one")
+        assert rows[0] == 1
 
 
 models__guard_model_sql = """

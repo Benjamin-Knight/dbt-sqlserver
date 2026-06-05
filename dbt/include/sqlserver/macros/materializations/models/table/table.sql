@@ -24,8 +24,16 @@
       "Valid values are: 'rename' (default), 'dml'."
     ) }}
   {%- endif -%}
+  {%- set full_refresh_build = config.get('full_refresh_build', 'heap_then_index') -%}
+  {#- prebuilt owns the rebuild boundaries (--full-refresh, first build);
+      table_refresh_method governs the steady-state refreshes in between -#}
+  {%- set use_prebuilt = (
+    full_refresh_build == 'prebuilt'
+    and (should_full_refresh() or existing_relation is none)
+  ) -%}
   {%- set use_dml_refresh = (
     table_refresh_method == 'dml'
+    and not use_prebuilt
     and existing_relation is not none
     and existing_relation.type == 'table'
   ) -%}
@@ -39,11 +47,9 @@
   -- `BEGIN` happens here:
   {{ run_hooks(pre_hooks, inside_transaction=True) }}
 
-  {%- set full_refresh_build = config.get('full_refresh_build', 'heap_then_index') -%}
-
   {% if use_dml_refresh %}
     {{ sqlserver__table_dml_refresh(target_relation, sql) }}
-  {% elif full_refresh_build == 'prebuilt' and (should_full_refresh() or existing_relation is none) %}
+  {% elif use_prebuilt %}
     {#- in-place rebuild: drop the existing table, then build the target
         directly with no intermediate or swap -#}
     {#- validate the index config BEFORE dropping anything -#}
