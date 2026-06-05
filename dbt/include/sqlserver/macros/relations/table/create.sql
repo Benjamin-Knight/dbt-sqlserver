@@ -32,7 +32,15 @@
         Trade-off (documented, no runtime warning): on Enterprise editions the
         rowstore load phase serializes on the B-tree insert and can be ~2x
         slower wall-clock than heap-then-parallel-index. -#}
-    {%- set wants_prebuilt = full_refresh_build == 'prebuilt' and not temporary -%}
+    {#- prebuilt only applies when building into an intermediate relation that
+        will be rename-swapped over the target (table materialization,
+        incremental/snapshot full refresh). Direct-on-target builds (e.g.
+        incremental first build) keep the atomic SELECT INTO: prebuilt there
+        would commit an empty, visible target before loading it, and a
+        mid-load failure would leave that empty table for the next run to
+        treat as already built. -#}
+    {%- set building_intermediate = this is not none and relation.render() != this.render() -%}
+    {%- set wants_prebuilt = full_refresh_build == 'prebuilt' and not temporary and building_intermediate -%}
 
     {#- rowstore prebuilt needs a clustered entry in the indexes config to
         pre-create; without one there is nothing to prebuild, so warn and use
@@ -47,7 +55,11 @@
             {%- endif -%}
         {%- endfor -%}
         {%- if prebuilt_ns.clustered_dict is none -%}
-            {{ log("full_refresh_build=prebuilt on " ~ this ~ " requires a clustered index in the indexes config; falling back to heap_then_index", info=true) }}
+            {#- nothing to prebuild without a clustered design; the default
+                SELECT INTO heap load is an equivalent bulk path, so this is a
+                debug-level trace, not a console warning (a table model would
+                emit it on every run) -#}
+            {% do log("full_refresh_build=prebuilt on " ~ this ~ " has no clustered index in the indexes config; using the default heap build") %}
             {%- set wants_prebuilt = false -%}
         {%- endif -%}
     {%- endif -%}

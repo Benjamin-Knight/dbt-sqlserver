@@ -10,8 +10,8 @@
 - Add `drop_unmanaged_indexes` config (`false` (default) / `warn` / `true`) for indexes dbt didn't create.
 - Validate cross-index config conflicts (multiple clustered indexes, clustered vs `as_columnstore`).
 - Document the minimum supported SQL Server version (2017). Partitioning, `XML_COMPRESSION` and ordered columnstore are not yet expressible in the `indexes` config.
-- Add `full_refresh_build` model config: `prebuilt` creates the new table empty with its clustered design in place, then loads via `INSERT WITH (TABLOCK)`, avoiding the uncompressed-heap stage and cutting peak rebuild disk. Default `heap_then_index` is unchanged.
-- `prebuilt` covers `as_columnstore`, rowstore (requires a clustered index in `indexes`; warns and falls back otherwise), incremental rebuilds and contract-enforced tables; DML table refresh is unaffected.
+- Add `full_refresh_build` model config: `prebuilt` creates the new table empty with its clustered design in place (the `as_columnstore` CCI, or the clustered index from `indexes`), then loads via `INSERT WITH (TABLOCK)`, avoiding the uncompressed-heap stage and cutting peak rebuild disk. Default `heap_then_index` is unchanged.
+- `prebuilt` only applies when building into the intermediate relation that is rename-swapped over the target (table materializations and `--full-refresh` rebuilds); the intermediate exists empty/loading during the build but the live target is never empty. Direct-on-target builds (e.g. incremental first build), rowstore models without a clustered index, and DML table refresh all keep the default build path.
 
 ### v1.10.0
 

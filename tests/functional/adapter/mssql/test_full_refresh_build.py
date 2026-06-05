@@ -197,11 +197,19 @@ class TestFullRefreshBuildRowstore:
         assert second == by_type
 
     def test_fallback_without_clustered(self, project, unique_schema):
+        # No clustered index in config: nothing to prebuild, so the default
+        # SELECT INTO heap path runs. That outcome is fine - so the fallback
+        # is a debug-level trace, NOT a console warning (a table model would
+        # otherwise emit it on every single run).
         _, output = run_dbt_and_capture(["run", "--models", "fallback_no_clustered"])
-        assert "falling back to heap_then_index" in output
+        assert "falling back" not in output
 
         by_type = get_rowstore_indexes(project, unique_schema, "fallback_no_clustered")
         assert set(by_type) == {"NONCLUSTERED"}
+
+        # rerun: still quiet, still heap + NCI
+        _, output = run_dbt_and_capture(["run", "--models", "fallback_no_clustered"])
+        assert "falling back" not in output
 
     def test_prebuilt_clustered_with_default_columnstore_errors(self, project):
         # as_columnstore defaults true: the existing cross-config validation
@@ -295,9 +303,13 @@ class TestFullRefreshBuildIncrementalAndContract:
         }
 
     def test_incremental_lifecycle(self, project, unique_schema):
-        # First build: direct on target, prebuilt applies.
+        # First build goes DIRECTLY onto the target relation (no swap), so
+        # prebuilt must NOT apply: it would commit an empty visible target and
+        # a mid-load failure would leave it behind for the next run to treat
+        # as already built. The atomic SELECT INTO path is kept; the clustered
+        # index still arrives via create_indexes after the build.
         _, output = run_dbt_and_capture(["run", "--models", "incr_prebuilt"])
-        assert "full_refresh_build=prebuilt" in output
+        assert "full_refresh_build=prebuilt" not in output
         first = get_rowstore_indexes(project, unique_schema, "incr_prebuilt")
         assert set(first) == {"CLUSTERED"}
         assert first["CLUSTERED"][0].startswith("dbt_idx_")
