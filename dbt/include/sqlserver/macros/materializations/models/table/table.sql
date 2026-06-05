@@ -46,6 +46,12 @@
   {% elif full_refresh_build == 'prebuilt' and (should_full_refresh() or existing_relation is none) %}
     {#- in-place rebuild: drop the existing table, then build the target
         directly with no intermediate or swap -#}
+    {#- validate the index config BEFORE dropping anything -#}
+    {% do adapter.validate_indexes(
+        config.get('indexes', default=[]),
+        config.get('as_columnstore', default=true),
+        config.get('drop_unmanaged_indexes', default=false)
+    ) %}
     {% if existing_relation is not none %}
       {% set existing_relation = load_cached_relation(existing_relation) %}
       {% if existing_relation is not none %}

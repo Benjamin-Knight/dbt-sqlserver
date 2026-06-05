@@ -104,6 +104,12 @@
         EXEC('SELECT TOP 0 * INTO {{ relation }} FROM {{ tmp_relation }}')
     {% endif %}
 
+    {# mark the rebuild in progress; removed atomically with the load below.
+       Normal incremental runs refuse to append while the marker is present. #}
+    EXEC sp_addextendedproperty @name = N'dbt_prebuilt_incomplete', @value = '1',
+        @level0type = N'SCHEMA', @level0name = N'{{ relation.schema }}',
+        @level1type = N'TABLE', @level1name = N'{{ relation.identifier }}'
+
     {% if as_columnstore %}
         {{ sqlserver__create_clustered_columnstore_index(relation) }}
     {% elif prebuilt_ns.clustered_dict is not none %}
@@ -116,16 +122,26 @@
                 {{ "["~column~"]" }}{{ ", " if not loop.last }}
             {%- endfor -%}
         {%- endset -%}
-        {%- set insert_query -%}
+        {%- set insert_statement -%}
             INSERT INTO {{ relation }} WITH (TABLOCK) ({{ listColumns }})
             SELECT {{ listColumns }} FROM {{ tmp_relation }} {{ query_label }}
         {%- endset -%}
     {%- else -%}
-        {%- set insert_query -%}
+        {%- set insert_statement -%}
             INSERT INTO {{ relation }} WITH (TABLOCK)
             SELECT * FROM {{ tmp_relation }} {{ query_label }}
         {%- endset -%}
     {%- endif %}
+    {#- load and unmark atomically: any failure rolls back and keeps the marker -#}
+    {%- set insert_query -%}
+        SET XACT_ABORT ON;
+        BEGIN TRANSACTION;
+        {{ insert_statement }};
+        EXEC sp_dropextendedproperty @name = N'dbt_prebuilt_incomplete',
+            @level0type = N'SCHEMA', @level0name = N'{{ relation.schema }}',
+            @level1type = N'TABLE', @level1name = N'{{ relation.identifier }}';
+        COMMIT TRANSACTION;
+    {%- endset %}
     EXEC('{{- escape_single_quotes(insert_query) -}}')
 
     EXEC('DROP VIEW IF EXISTS {{ tmp_relation.include(database=False) }}')

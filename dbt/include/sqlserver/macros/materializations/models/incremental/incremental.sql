@@ -43,6 +43,12 @@
       {#- in-place full refresh: drop the existing table, rebuild the target
           directly with no intermediate or swap (explicit --full-refresh
           only; view->table conversions keep the default path) -#}
+      {#- validate the index config BEFORE dropping anything -#}
+      {% do adapter.validate_indexes(
+          config.get('indexes', default=[]),
+          config.get('as_columnstore', default=true),
+          config.get('drop_unmanaged_indexes', default=false)
+      ) %}
       {% do adapter.drop_relation(existing_relation) %}
       {% set build_sql = sqlserver__create_table_as_prebuilt(target_relation, sql) %}
     {% else %}
@@ -50,6 +56,23 @@
       {% set need_swap = true %}
     {% endif %}
   {% else %}
+
+    {% if config.get('full_refresh_build', 'heap_then_index') == 'prebuilt' %}
+      {#- refuse to append onto a table left behind by an unfinished prebuilt
+          rebuild -#}
+      {% set marker = run_query(
+          "select count(*) from sys.extended_properties where major_id = OBJECT_ID('"
+          ~ existing_relation.schema ~ "." ~ existing_relation.identifier
+          ~ "') and name = 'dbt_prebuilt_incomplete'"
+      ) %}
+      {% if marker.rows[0][0] > 0 %}
+        {{ exceptions.raise_compiler_error(
+            "A previous full_refresh_build=prebuilt rebuild of " ~ existing_relation
+            ~ " did not complete; the table may be empty or partially loaded. "
+            "Rerun with --full-refresh."
+        ) }}
+      {% endif %}
+    {% endif %}
 
     {% do run_query(get_create_table_as_sql(True, temp_relation, sql)) %}
 

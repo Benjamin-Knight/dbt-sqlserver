@@ -1,8 +1,5 @@
-{% macro sqlserver__create_clustered_columnstore_index(relation, name_relation=none) -%}
-    {#- name_relation: optionally name the CCI for a different relation than
-        the one it is created on -#}
-    {%- set name_rel = name_relation or relation -%}
-    {%- set cci_name = (name_rel.schema ~ '_' ~ name_rel.identifier ~ '_cci') | replace(".", "") | replace(" ", "") -%}
+{% macro sqlserver__create_clustered_columnstore_index(relation) -%}
+    {%- set cci_name = (relation.schema ~ '_' ~ relation.identifier ~ '_cci') | replace(".", "") | replace(" ", "") -%}
     {%- set relation_name = relation.schema ~ '_' ~ relation.identifier -%}
     {%- set full_relation = '"' ~ relation.schema ~ '"."' ~ relation.identifier ~ '"' -%}
     use [{{ relation.database }}];
@@ -241,11 +238,9 @@
 {% endmacro %}
 
 
-{% macro sqlserver__get_create_index_sql(relation, index_dict, name_relation=none) -%}
-  {#- name_relation: optionally render the name against a different relation
-      than the one the index is created on -#}
+{% macro sqlserver__get_create_index_sql(relation, index_dict) -%}
   {%- set index_config = adapter.parse_index(index_dict) -%}
-  {%- set index_name = index_config.render(name_relation or relation) -%}
+  {%- set index_name = index_config.render(relation) -%}
 
   {# Validations are made on the adapter class SQLServerIndexConfig to control resulting sql #}
   {# names hash the full definition, so a same-named index is already correct: skip #}

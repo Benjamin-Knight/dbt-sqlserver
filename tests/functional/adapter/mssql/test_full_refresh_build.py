@@ -203,7 +203,8 @@ class TestFullRefreshBuildRowstore:
         _, output = run_dbt_and_capture(
             ["run", "--models", "fallback_no_clustered", "--full-refresh"]
         )
-        assert "falling back" not in output
+        # the heap-fallback trace is debug level: never on the console
+        assert "loading in place as a heap" not in output
 
         by_type = get_rowstore_indexes(project, unique_schema, "fallback_no_clustered")
         assert set(by_type) == {"NONCLUSTERED"}
@@ -212,7 +213,7 @@ class TestFullRefreshBuildRowstore:
         _, output = run_dbt_and_capture(
             ["run", "--models", "fallback_no_clustered", "--full-refresh"]
         )
-        assert "falling back" not in output
+        assert "loading in place as a heap" not in output
 
     def test_prebuilt_clustered_with_default_columnstore_errors(self, project):
         # as_columnstore defaults true: the existing cross-config validation
@@ -337,8 +338,10 @@ class TestFullRefreshBuildIncrementalAndContract:
         assert "full_refresh_build=prebuilt" not in output
 
     def test_dml_refresh_ignores_prebuilt(self, project, unique_schema):
-        # dml mode never swaps, so prebuilt never applies to its refreshes
-        run_dbt(["run", "--models", "dml_prebuilt"])
+        # first build: prebuilt applies (opted in, indices from birth);
+        # dml refreshes thereafter never swap, so prebuilt never applies
+        _, output = run_dbt_and_capture(["run", "--models", "dml_prebuilt"])
+        assert "full_refresh_build=prebuilt" in output
         _, output = run_dbt_and_capture(["run", "--models", "dml_prebuilt"])
         assert "full_refresh_build=prebuilt" not in output
         by_type = get_rowstore_indexes(project, unique_schema, "dml_prebuilt")
@@ -347,3 +350,87 @@ class TestFullRefreshBuildIncrementalAndContract:
         # dml takes precedence even under --full-refresh
         _, output = run_dbt_and_capture(["run", "--models", "dml_prebuilt", "--full-refresh"])
         assert "full_refresh_build=prebuilt" not in output
+
+
+models__guard_model_sql = """
+{{
+  config(
+    materialized = "incremental",
+    as_columnstore = False,
+    full_refresh_build = "prebuilt",
+    indexes = var('guard_indexes', [{'columns': ['column_a'], 'type': 'clustered'}])
+  )
+}}
+
+select *
+from (
+  select 1 as column_a, 2 as column_b
+) t
+
+{% if is_incremental() %}
+    where column_a > (select max(column_a) from {{this}})
+{% endif %}
+
+"""
+
+
+class TestFullRefreshBuildSafety:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {"guard_model.sql": models__guard_model_sql}
+
+    def row_count(self, project, unique_schema):
+        return project.run_sql(f"select count(*) from {unique_schema}.guard_model", fetch="one")[0]
+
+    def test_invalid_config_validated_before_drop(self, project, unique_schema):
+        run_dbt(["run", "--models", "guard_model"])
+        # an out-of-band row the model cannot regenerate: proves the OLD
+        # table survived rather than being dropped and rebuilt
+        project.run_sql(f"insert into {unique_schema}.guard_model values (99, 99)")
+        assert self.row_count(project, unique_schema) == 2
+
+        # An invalid index set (two clustered entries) must fail BEFORE the
+        # old table is dropped.
+        bad = (
+            "[{'columns': ['column_a'], 'type': 'clustered'},"
+            " {'columns': ['column_b'], 'type': 'clustered'}]"
+        )
+        run_dbt_and_capture(
+            [
+                "run",
+                "--models",
+                "guard_model",
+                "--full-refresh",
+                "--vars",
+                f"guard_indexes: {bad}",
+            ],
+            expect_pass=False,
+        )
+        assert self.row_count(project, unique_schema) == 2
+
+    def test_failed_rebuild_blocks_normal_incremental_run(self, project, unique_schema):
+        run_dbt(["run", "--models", "guard_model"])
+
+        # Simulate a prebuilt rebuild that died mid-load: empty table carrying
+        # the in-progress marker.
+        project.run_sql(f"truncate table {unique_schema}.guard_model")
+        project.run_sql(f"""EXEC sp_addextendedproperty @name = N'dbt_prebuilt_incomplete',
+                @value = '1', @level0type = N'SCHEMA',
+                @level0name = '{unique_schema}',
+                @level1type = N'TABLE', @level1name = 'guard_model'""")
+
+        # A normal incremental run must ERROR, not silently append.
+        _, output = run_dbt_and_capture(["run", "--models", "guard_model"], expect_pass=False)
+        assert "did not complete" in output
+        assert "--full-refresh" in output
+
+        # --full-refresh recovers and clears the marker.
+        run_dbt(["run", "--models", "guard_model", "--full-refresh"])
+        assert self.row_count(project, unique_schema) == 1
+        marker = project.run_sql(
+            f"""select count(*) from sys.extended_properties
+                where major_id = OBJECT_ID('{unique_schema}.guard_model')
+                and name = 'dbt_prebuilt_incomplete'""",
+            fetch="one",
+        )
+        assert marker[0] == 0
