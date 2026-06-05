@@ -1,8 +1,6 @@
 {% macro sqlserver__create_clustered_columnstore_index(relation, name_relation=none) -%}
-    {#- name_relation: name the CCI for a different relation than the one it is
-        created on - the prebuilt build path creates it on the intermediate
-        relation but names it for the final target so the name survives the
-        rename swap. Default preserves the legacy behavior. -#}
+    {#- name_relation: optionally name the CCI for a different relation than
+        the one it is created on -#}
     {%- set name_rel = name_relation or relation -%}
     {%- set cci_name = (name_rel.schema ~ '_' ~ name_rel.identifier ~ '_cci') | replace(".", "") | replace(" ", "") -%}
     {%- set relation_name = relation.schema ~ '_' ~ relation.identifier -%}
@@ -244,17 +242,13 @@
 
 
 {% macro sqlserver__get_create_index_sql(relation, index_dict, name_relation=none) -%}
-  {#- name_relation: render the deterministic name against a different relation
-      than the one the index is created on. The prebuilt build path creates
-      the clustered index on the intermediate relation but names it for the
-      final target, so after the rename swap the IF NOT EXISTS guard in
-      create_indexes/reconcile matches and the index is never rebuilt. -#}
+  {#- name_relation: optionally render the name against a different relation
+      than the one the index is created on -#}
   {%- set index_config = adapter.parse_index(index_dict) -%}
   {%- set index_name = index_config.render(name_relation or relation) -%}
 
   {# Validations are made on the adapter class SQLServerIndexConfig to control resulting sql #}
-  {# Names are a deterministic hash of the full definition, so an existing #}
-  {# index with this name is already the index we want: skip, don't fail.  #}
+  {# names hash the full definition, so a same-named index is already correct: skip #}
   if not exists(select *
                   from sys.indexes {{ information_schema_hints() }}
                   where name = '{{ index_name }}'
@@ -342,13 +336,10 @@
         i.filter_definition as [where],
         i.fill_factor as [fillfactor],
         i.ignore_dup_key as [ignore_dup_key]
-        /* optimize_for_sequential_key is deliberately not selected: the
-           sys.indexes column only exists on SQL Server 2019+ and managed
-           comparisons are name-based, so it isn't needed here */
+        /* optimize_for_sequential_key not selected: sys.indexes column is 2019+ only */
     from sys.indexes i {{ information_schema_hints() }}
     outer apply (
-        /* STRING_AGG ... WITHIN GROUP requires SQL Server 2017+, the floor
-           of this adapter's CI matrix */
+        /* STRING_AGG ... WITHIN GROUP requires SQL Server 2017+ */
         select string_agg(col.[name], ', ') within group (order by ic.key_ordinal) as cols
         from sys.index_columns ic
         inner join sys.columns col
@@ -373,8 +364,7 @@
           and ic.is_descending_key = 1
     ) desc_cols
     outer apply (
-        /* MAX() rather than TOP 1: deterministic if partitions ever carry
-           mixed compression (the adapter doesn't manage partitioning today) */
+        /* MAX(): deterministic across partitions */
         select max(p.data_compression_desc) as data_compression_desc
         from sys.partitions p
         where p.object_id = i.object_id and p.index_id = i.index_id
@@ -393,12 +383,9 @@
 
 
 {% macro sqlserver__create_indexes(relation) %}
-  {#-
-    Override of the dbt-adapters default to validate the index set as a whole
-    (at most one clustered; clustered rowstore vs as_columnstore conflict)
-    before creating anything. as_columnstore is only honored by
-    create_table_as, so it is irrelevant for seeds despite defaulting true.
-  -#}
+  {#- dbt-adapters override: validate the index set as a whole before
+      creating anything (as_columnstore only applies to materializations
+      that build via create_table_as, so not seeds) -#}
   {%- set raw_indexes = config.get('indexes', default=[]) -%}
   {%- set materialized = config.get('materialized') -%}
   {%- set as_columnstore = config.get('as_columnstore', default=true)
@@ -416,15 +403,9 @@
 
 
 {% macro sqlserver__reconcile_indexes(relation) %}
-  {#-
-    Converge an existing relation on its configured index set. Called on the
-    paths where the relation persists across runs (incremental non-full-
-    refresh, dml table refresh, snapshot updates), where create_indexes alone
-    would let config changes drift.
-  -#}
+  {#- converge a persisting relation on its configured index set -#}
   {%- set raw_indexes = config.get('indexes', default=[]) -%}
   {%- set drop_unmanaged = config.get('drop_unmanaged_indexes', default=false) -%}
-  {#- all three callers (incremental, dml refresh, snapshot) honor as_columnstore -#}
   {%- do adapter.validate_indexes(
       raw_indexes, config.get('as_columnstore', default=true), drop_unmanaged
   ) -%}
@@ -433,10 +414,7 @@
   {%- for warning in result['warnings'] %}
     {% do log("Index reconcile on " ~ relation ~ ": " ~ warning, info=true) %}
   {%- endfor %}
-  {#- Apply all drops and creates in ONE transactional batch: a definition
-      change is then atomic, with no window where a replacement index (or the
-      uniqueness it enforces) is missing for concurrent readers. xact_abort
-      guarantees rollback if any statement fails mid-batch. -#}
+  {#- apply all drops then creates as one transactional batch -#}
   {%- set reconcile_statements = [] -%}
   {%- for index_name in result['drops'] %}
     {% do log("Dropping index " ~ index_name ~ " on " ~ relation, info=true) %}

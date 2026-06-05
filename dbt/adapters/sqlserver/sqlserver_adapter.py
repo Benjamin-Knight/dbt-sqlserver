@@ -303,9 +303,8 @@ class SQLServerAdapter(SQLAdapter):
     def validate_indexes(
         self, raw_indexes: Any, as_columnstore: Any = False, drop_unmanaged: Any = False
     ) -> None:
-        """Cross-config checks that individual index validation can't see.
-        Also fail-fast validates drop_unmanaged_indexes so a bad value errors
-        on the first build, not only when reconciliation first runs."""
+        """Cross-config index checks, plus fail-fast validation of
+        drop_unmanaged_indexes."""
         normalize_drop_unmanaged(drop_unmanaged)
         configs = []
         for raw_index in raw_indexes or []:
@@ -337,10 +336,8 @@ class SQLServerAdapter(SQLAdapter):
         drop_unmanaged: Any = False,
     ) -> dict:
         """Diff existing indexes (agate table from sqlserver__describe_indexes)
-        against the model's `indexes` config. Returns plain lists for jinja:
-        drops (index names), creates (index config dicts), warnings (strings).
-        Drops must be applied before creates (a replacement clustered index
-        needs its predecessor gone first)."""
+        against the model's `indexes` config. Returns jinja-friendly lists:
+        drops (names, apply first), creates (index config dicts), warnings."""
         rows = []
         if existing_indexes is not None:
             column_names = existing_indexes.column_names

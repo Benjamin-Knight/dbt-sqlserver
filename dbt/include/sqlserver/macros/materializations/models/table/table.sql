@@ -44,16 +44,8 @@
   {% if use_dml_refresh %}
     {{ sqlserver__table_dml_refresh(target_relation, sql) }}
   {% elif full_refresh_build == 'prebuilt' and (should_full_refresh() or existing_relation is none) %}
-    {#- In-place rebuild, under an explicit --full-refresh or on first build
-        (no pre-existing table to keep visible; the initial load lands
-        compressed into its clustered design): drop the old table FIRST
-        (freeing its space), then create the target empty with its clustered
-        design and bulk-load it. No intermediate, no backup, no swap - peak
-        disk is ~1x instead of 2x. The target is empty/loading for the
-        duration of the build, and a failed build leaves an empty or partial
-        table (recovery: rerun --full-refresh). Normal runs over an existing
-        table keep the default swap build so live tables stay in place and
-        visible. -#}
+    {#- in-place rebuild: drop the existing table, then build the target
+        directly with no intermediate or swap -#}
     {% if existing_relation is not none %}
       {% set existing_relation = load_cached_relation(existing_relation) %}
       {% if existing_relation is not none %}

@@ -15,21 +15,16 @@ from dbt.adapters.relation_configs import (
     RelationConfigValidationRule,
 )
 
-# Prefix identifying indexes whose lifecycle is managed by the adapter via the
-# `indexes` model config. Reconciliation only ever drops indexes carrying it.
+# Prefix of indexes managed via the `indexes` model config; reconciliation
+# only ever drops indexes carrying it.
 SQLSERVER_MANAGED_INDEX_PREFIX = "dbt_idx_"
 
-# Names created by the legacy post-hook macros (create_clustered_index /
-# create_nonclustered_index). Existing users rely on those post-hooks, so
-# reconciliation must never drop them — not even under
-# drop_unmanaged_indexes: true.
+# Names created by the legacy post-hook macros; never dropped in any mode.
 LEGACY_INDEX_PREFIXES = ("clustered_", "nonclustered_")
 
 VALID_DROP_UNMANAGED_MODES = ("false", "warn", "true")
 
-# CREATE INDEX WITH(...) options that only affect HOW the index is built, not
-# WHAT it is. They are excluded from the name hash and from equality, so
-# changing them never triggers a drop/recreate on reconcile.
+# Build-time WITH(...) options; excluded from the name hash and equality.
 VALID_BUILD_OPTIONS = (
     "online",
     "maxdop",
@@ -104,13 +99,10 @@ class SQLServerIndexConfig(RelationConfigBase, RelationConfigValidationMixin, db
     - ignore_dup_key: discard duplicate rows instead of erroring (unique rowstore)
     - optimize_for_sequential_key: last-page contention optimization
       (rowstore, SQL Server 2019+)
-    - sort_in_tempdb: build-time option for the create statement; deliberately
-      excluded from identity (not introspectable and doesn't change the
-      resulting index, so it must not trigger drop/recreate)
+    - sort_in_tempdb: build-time option, excluded from the name hash
 
-    All definition-affecting fields participate in the rendered name hash, but
-    only when set - so names of pre-existing managed indexes stay stable when
-    the adapter adds new optional fields.
+    Definition fields join the rendered name hash only when set, keeping
+    pre-existing managed index names stable as fields are added.
     """
 
     name: str = field(default="", hash=False, compare=False)
@@ -269,10 +261,9 @@ class SQLServerIndexConfig(RelationConfigBase, RelationConfigValidationMixin, db
                 names.append(entry)
         return names, descending
 
-    # NOTE: no custom from_dict override here - dbtClassMixin (mashumaro)
-    # generates from_dict during class creation and silently replaces any
-    # method defined in the class body, so an override would be dead code.
-    # Raw-input normalization therefore lives in parse() below.
+    # NOTE: do not define from_dict here - mashumaro (dbtClassMixin) silently
+    # replaces it with a generated method; raw-input normalization lives in
+    # parse() instead.
 
     @classmethod
     def parse_model_node(cls, model_node_entry: dict) -> dict:
@@ -355,19 +346,9 @@ class SQLServerIndexConfig(RelationConfigBase, RelationConfigValidationMixin, db
         return node_config
 
     def render(self, relation):
-        # Deterministic full-definition hash. Unlike Postgres (dbt-core#1945),
-        # SQL Server index names are scoped per table, so a renamed backup
-        # relation keeping the same index names cannot collide with the new
-        # target's indexes — no timestamp salt is needed. Determinism is what
-        # makes name equality <=> definition equality, which reconciliation
-        # relies on; create idempotency comes from the IF NOT EXISTS guard in
-        # sqlserver__get_create_index_sql.
-        # Build-time options (sort_in_tempdb, build_options) are deliberately
-        # NOT hashed: they don't change the resulting index, so toggling them
-        # must not produce a new name (which would drop/recreate on reconcile).
-        # Optional definition fields are appended ONLY when set, with a field
-        # prefix, so pre-existing managed index names stay stable as the
-        # adapter grows new options.
+        # Deterministic full-definition hash: name equality <=> definition
+        # equality. Build-time options are not hashed; optional fields are
+        # appended only when set so existing names stay stable.
         inputs = (
             self.columns
             + tuple(sorted(self.included_columns))
@@ -393,10 +374,7 @@ class SQLServerIndexConfig(RelationConfigBase, RelationConfigValidationMixin, db
         try:
             if not isinstance(raw_index, dict):
                 raise IndexConfigNotDictError(raw_index)
-            # Normalize BEFORE jsonschema validation: {'column','desc'} entries
-            # become plain names + descending_columns, and data_compression is
-            # case/'none'-normalized. mashumaro replaces from_dict overrides,
-            # so this is the only place raw input can be massaged.
+            # normalize raw input before jsonschema validation
             normalized = dict(raw_index)
             if isinstance(normalized.get("columns"), list):
                 names, descending = cls._normalize_columns(normalized["columns"])
@@ -481,33 +459,14 @@ def index_config_changes(
     relation,
     drop_unmanaged="false",
 ):
-    """Compute the index changes needed to converge an existing relation on its
-    configured index set.
+    """Diff existing indexes (sqlserver__describe_indexes rows) against the
+    expected configs by name (deterministic names: name equality <=>
+    definition equality).
 
-    Managed indexes (dbt_idx_ prefix) carry a deterministic full-definition
-    hash in their name, so name equality <=> definition equality: drops are
-    "managed names not expected", creates are "expected names not present".
-
-    Args:
-        existing_rows: rows from sqlserver__describe_indexes (mappings with
-            name/type/unique/columns/included_columns/data_compression plus
-            is_primary_key/is_unique_constraint flags)
-        expected_configs: list of SQLServerIndexConfig from the model config
-        relation: the target relation (for rendering expected names)
-        drop_unmanaged: "false" (default) | "warn" | "true" - how to treat
-            droppable indexes dbt didn't create. Constraint-backing indexes
-            and legacy post-hook (clustered_/nonclustered_) indexes are never
-            dropped in any mode.
-
-    Returns:
-        (changes, warnings): changes is a list of SQLServerIndexConfigChange
-        with all drops ordered before all creates; warnings is a list of
-        messages about unmanaged indexes (populated in "warn" mode).
-
-    Raises:
-        DbtRuntimeError: for an invalid drop_unmanaged value, or when an
-            expected clustered index is blocked by an existing clustered index
-            that will not be dropped (a table can only have one).
+    Returns (changes, warnings): changes lists drops before creates;
+    warnings lists unmanaged indexes in "warn" mode. Raises DbtRuntimeError
+    on an invalid drop_unmanaged value or when an expected clustered index
+    is blocked by an existing non-droppable clustered index.
     """
     drop_unmanaged = normalize_drop_unmanaged(drop_unmanaged)
 
@@ -525,8 +484,7 @@ def index_config_changes(
         protected = (
             bool(row.get("is_primary_key"))
             or bool(row.get("is_unique_constraint"))
-            # The adapter's own as_columnstore CCI lives outside the indexes
-            # config; dropping it would silently convert the table to a heap.
+            # the as_columnstore CCI is managed outside the indexes config
             or str(row.get("type") or "") == "clustered columnstore"
         )
         if protected:
@@ -535,8 +493,6 @@ def index_config_changes(
             drop_names.append(name)
             continue
         if name.startswith(LEGACY_INDEX_PREFIXES):
-            # Legacy post-hook indexes: the owning post-hook would recreate
-            # them right after we dropped them. Never touch.
             continue
         if drop_unmanaged == "true":
             drop_names.append(name)
@@ -556,8 +512,7 @@ def index_config_changes(
         blocking = [
             row.get("name")
             for row in existing_rows
-            # 'clustered' and 'clustered columnstore' both occupy the one
-            # clustered slot a table has.
+            # 'clustered' and 'clustered columnstore' both take the one clustered slot
             if str(row.get("type") or "").startswith("clustered")
             and row.get("name") not in expected_by_name
             and row.get("name") not in drop_names

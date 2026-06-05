@@ -69,8 +69,7 @@
       DROP TABLE IF EXISTS {{ refresh_relation }};
     {%- endcall %}
 
-    {# The target table persisted (no rebuild), so converge its indexes on
-       the config. Runs after the swap's self-contained transaction. #}
+    {# converge the persisted target's indexes on the config #}
     {% do sqlserver__reconcile_indexes(target_relation) %}
 
   {% else %}

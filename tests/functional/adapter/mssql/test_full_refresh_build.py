@@ -64,18 +64,14 @@ class TestFullRefreshBuildColumnstore:
         return {"cci_prebuilt.sql": models__cci_prebuilt_sql}
 
     def test_cci_prebuilt_lifecycle(self, project, unique_schema):
-        # prebuilt applies ONLY under --full-refresh; it creates the table
-        # empty with its CCI in place, then bulk-loads in place. (Tiny test
-        # row counts land in delta rowgroups rather than compressed segments
-        # - the <102,400 rows/thread threshold - so we assert physical
-        # design, not rowgroup state.)
+        # tiny row counts land in delta rowgroups, so assert physical
+        # design rather than rowgroup state
         _, output = run_dbt_and_capture(["run", "--models", "cci_prebuilt", "--full-refresh"])
         assert "full_refresh_build=prebuilt" in output
 
         indexes = get_cci_indexes(project, unique_schema, "cci_prebuilt")
         assert len(indexes) == 1
         assert indexes[0][1] == "CLUSTERED COLUMNSTORE"
-        # Named for the TARGET relation, not the dbt_tmp intermediate.
         assert "dbt_tmp" not in indexes[0][0]
         first_name = indexes[0][0]
 
@@ -83,16 +79,14 @@ class TestFullRefreshBuildColumnstore:
         rows = project.run_sql(f"select count(*) from {unique_schema}.cci_prebuilt", fetch="one")
         assert rows[0] == 2
 
-        # Second full refresh: still exactly one CCI, stable name, no
-        # leftover heap or backup copies.
+        # second full refresh: one CCI, stable name, no leftovers
         _, output = run_dbt_and_capture(["run", "--models", "cci_prebuilt", "--full-refresh"])
         assert "full_refresh_build=prebuilt" in output
         indexes = get_cci_indexes(project, unique_schema, "cci_prebuilt")
         assert len(indexes) == 1
         assert indexes[0][0] == first_name
 
-        # NORMAL run: default swap build, tables stay in place/visible -
-        # prebuilt must not fire without --full-refresh.
+        # normal run: default swap build, no prebuilt
         _, output = run_dbt_and_capture(["run", "--models", "cci_prebuilt"])
         assert "full_refresh_build=prebuilt" not in output
         assert len(get_cci_indexes(project, unique_schema, "cci_prebuilt")) == 1
@@ -185,12 +179,9 @@ class TestFullRefreshBuildRowstore:
         assert set(by_type) == {"CLUSTERED", "NONCLUSTERED"}
 
         clustered_name, clustered_compression = by_type["CLUSTERED"]
-        # Named for the TARGET relation hash (pre-created on the intermediate,
-        # surviving the swap with the name create_indexes expects).
         assert clustered_name.startswith("dbt_idx_")
-        # Compress-on-insert: PAGE already applied, no rebuild needed.
+        # compress-on-insert
         assert clustered_compression == "PAGE"
-        # The NCI came from create_indexes(target) after the swap.
         assert by_type["NONCLUSTERED"][0].startswith("dbt_idx_")
 
         rows = project.run_sql(
@@ -208,10 +199,7 @@ class TestFullRefreshBuildRowstore:
         assert "full_refresh_build=prebuilt" not in output
 
     def test_fallback_without_clustered(self, project, unique_schema):
-        # No clustered index in config: nothing to prebuild, so the default
-        # SELECT INTO heap path runs. That outcome is fine - so the fallback
-        # is a debug-level trace, NOT a console warning (a table model would
-        # otherwise emit it on every single run).
+        # no clustered index: loads as a heap with no console warning
         _, output = run_dbt_and_capture(
             ["run", "--models", "fallback_no_clustered", "--full-refresh"]
         )
@@ -318,22 +306,19 @@ class TestFullRefreshBuildIncrementalAndContract:
         }
 
     def test_incremental_lifecycle(self, project, unique_schema):
-        # First build: no pre-existing table to keep visible, so prebuilt
-        # applies - the initial load lands compressed into its clustered
-        # design instead of building a heap first.
+        # first build: prebuilt applies (no existing table)
         _, output = run_dbt_and_capture(["run", "--models", "incr_prebuilt"])
         assert "full_refresh_build=prebuilt" in output
         first = get_rowstore_indexes(project, unique_schema, "incr_prebuilt")
         assert set(first) == {"CLUSTERED"}
         assert first["CLUSTERED"][0].startswith("dbt_idx_")
 
-        # Plain incremental run: the temp relation build must NOT take the
-        # prebuilt path (temporary=True bypass); reconcile leaves the index.
+        # plain incremental run: no prebuilt
         _, output = run_dbt_and_capture(["run", "--models", "incr_prebuilt"])
         assert "full_refresh_build=prebuilt" not in output
         assert get_rowstore_indexes(project, unique_schema, "incr_prebuilt") == first
 
-        # Full refresh: rebuild via intermediate->swap, stable name.
+        # full refresh: prebuilt, stable index name
         _, output = run_dbt_and_capture(["run", "--models", "incr_prebuilt", "--full-refresh"])
         assert "full_refresh_build=prebuilt" in output
         assert get_rowstore_indexes(project, unique_schema, "incr_prebuilt") == first
@@ -352,17 +337,13 @@ class TestFullRefreshBuildIncrementalAndContract:
         assert "full_refresh_build=prebuilt" not in output
 
     def test_dml_refresh_ignores_prebuilt(self, project, unique_schema):
-        # table_refresh_method=dml builds its scratch via its own SELECT INTO,
-        # not create_table_as: prebuilt is out of scope there by design. First
-        # build goes through create_table_as (rename path) and DOES prebuild;
-        # the second, pure-DML run must not.
+        # dml mode never swaps, so prebuilt never applies to its refreshes
         run_dbt(["run", "--models", "dml_prebuilt"])
         _, output = run_dbt_and_capture(["run", "--models", "dml_prebuilt"])
         assert "full_refresh_build=prebuilt" not in output
         by_type = get_rowstore_indexes(project, unique_schema, "dml_prebuilt")
         assert set(by_type) == {"CLUSTERED"}
 
-        # dml takes precedence even under --full-refresh (it never swaps, so
-        # the swap-avoidance flag has nothing to do)
+        # dml takes precedence even under --full-refresh
         _, output = run_dbt_and_capture(["run", "--models", "dml_prebuilt", "--full-refresh"])
         assert "full_refresh_build=prebuilt" not in output

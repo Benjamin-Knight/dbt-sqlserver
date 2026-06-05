@@ -59,27 +59,11 @@
 
 {% macro sqlserver__create_table_as_prebuilt(relation, sql) -%}
     {#-
-      In-place rebuild for full_refresh_build=prebuilt. Called by the
-      materializations on full-refresh paths AFTER they have dropped the
-      existing target: the table is created EMPTY directly under its final
-      name with its clustered design in place (the as_columnstore CCI or the
-      clustered entry from the indexes config), then bulk-loaded with
-      INSERT WITH (TABLOCK).
-
-      Compared to the default build-intermediate-and-swap, this never holds
-      two copies of the data, so peak disk is ~1x instead of 2x plus the
-      uncompressed-heap overshoot. The trade-offs, by design:
-        - the target is empty/loading while the rebuild runs (readers under
-          RCSI see an empty table rather than the previous data);
-        - there is no backup copy: a failed rebuild leaves an empty or
-          partial table, and recovery is rerunning with --full-refresh.
-      The TABLOCK insert into the empty clustered target is minimally logged
-      under SIMPLE/bulk-logged recovery; rowstore compresses on insert and
-      columnstore loads parallel direct-to-compressed (batches under
-      ~102,400 rows/thread land in delta rowgroups).
-      Enterprise note (documented, no runtime warning): the rowstore load
-      serializes on the B-tree insert and can be ~2x slower wall-clock than
-      heap-then-parallel-index.
+      In-place build for full_refresh_build=prebuilt: create the table empty
+      under its final name with its clustered design (the as_columnstore CCI
+      or the clustered entry from the indexes config), then bulk-load it via
+      INSERT WITH (TABLOCK). Callers drop any existing target first.
+      See the CHANGELOG for the trade-offs of this build mode.
     -#}
     {%- set query_label = get_query_options(parse_options=True) -%}
     {%- set as_columnstore = config.get('as_columnstore', default=true) -%}
@@ -87,12 +71,8 @@
     {%- set contract_enforced = contract_config.enforced -%}
     {%- set tmp_relation = relation.incorporate(path={"identifier": relation.identifier ~ '__dbt_tmp_vw'}, type='view') -%}
 
-    {#- rowstore prebuilt needs a clustered entry in the indexes config;
-        without one there is nothing to prebuild and the plain SELECT INTO
-        below is an equivalent bulk heap load, so this is a debug-level
-        trace, not a console warning (a table model would emit it on every
-        run). validate_indexes guarantees at most one clustered entry and
-        rejects clustered x as_columnstore conflicts. -#}
+    {#- find the clustered entry (validate_indexes guarantees at most one);
+        without one the table loads in place as a heap -#}
     {%- set prebuilt_ns = namespace(clustered_dict=none) -%}
     {%- if not as_columnstore -%}
         {%- for raw_index in config.get('indexes', default=[]) -%}

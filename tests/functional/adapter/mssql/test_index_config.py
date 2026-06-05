@@ -491,9 +491,7 @@ class TestSQLServerIndex:
             assert indexes == expected
 
     def test_table_indexes_stable_across_runs(self, project, unique_schema):
-        # Deterministic naming: a rebuild must produce the same index *names*
-        # (reconciliation relies on name equality <=> definition equality),
-        # and the definition set must never accumulate.
+        # rebuilds must produce identical index names and definitions
         results = run_dbt(["run", "--models", "table"])
         assert len(results) == 1
         first_names = self.get_index_names("table", project, unique_schema)
@@ -509,8 +507,7 @@ class TestSQLServerIndex:
         assert len(first_defs) == 5
 
     def test_table_reserved_word_columns(self, project, unique_schema):
-        # Index key and included columns must be bracket-quoted: this model
-        # indexes columns named after T-SQL reserved words.
+        # key and include columns are bracket-quoted (reserved words)
         results = run_dbt(["run", "--models", "table_reserved"])
         assert len(results) == 1
 
@@ -774,7 +771,7 @@ class TestSQLServerDropUnmanagedIndexes:
         run_dbt(["run", "--models", "drop_unmanaged"])
         self.seed_out_of_band_indexes(project, unique_schema)
 
-        # Default (false): managed orphan swept, everything else kept.
+        # default (false): managed orphan swept, everything else kept
         run_dbt(["run", "--models", "drop_unmanaged"])
         names = self.names(project, unique_schema)
         assert "dbt_idx_orphan" not in names
@@ -983,9 +980,7 @@ select 1 as column_a, 2 as column_b
 
 
 class TestSQLServerProjectLevelIndexes:
-    """indexes set as keys in dbt_project.yml (models scope) must behave the
-    same as in-model config, and a model-level indexes config must fully
-    replace (clobber, not merge) the project-level list."""
+    """dbt_project.yml model-scope indexes apply; model-level config clobbers them."""
 
     @pytest.fixture(scope="class")
     def models(self):
