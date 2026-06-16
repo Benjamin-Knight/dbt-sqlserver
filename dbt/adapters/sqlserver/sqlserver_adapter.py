@@ -300,6 +300,16 @@ class SQLServerAdapter(SQLAdapter):
         return SQLServerIndexConfig.parse(raw_index)
 
     @available
+    def index_needs_own_batch(self, raw_index: Any) -> bool:
+        """True when an index's build_options (ONLINE / RESUMABLE) require it to
+        be created outside any transaction. Such indexes are skipped by the
+        in-transaction create/reconcile paths and built in the materialization's
+        post-commit phase instead (sqlserver__create_indexes_post_commit). Single
+        source of truth for both the create and reconcile macros."""
+        parsed = self.parse_index(raw_index)
+        return bool(parsed and create_needs_own_batch(parsed.build_options))
+
+    @available
     def validate_indexes(
         self, raw_indexes: Any, as_columnstore: Any = False, drop_unmanaged: Any = False
     ) -> None:
