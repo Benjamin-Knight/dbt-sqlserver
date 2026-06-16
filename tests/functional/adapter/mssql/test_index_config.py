@@ -1069,3 +1069,75 @@ class TestSQLServerEarlyValidation:
         # snapshot config must be rejected with the clear cross-config error.
         _, output = run_dbt_and_capture(["snapshot"], expect_pass=False)
         assert "as_columnstore" in output
+
+
+models__online_table_sql = """
+{{
+  config(
+    materialized = "table",
+    as_columnstore = False,
+    indexes=[
+      {'columns': ['column_a'], 'build_options': {'online': True}},
+      {'columns': ['column_b'], 'build_options': {'online': True, 'resumable': True}},
+    ]
+  )
+}}
+
+select 1 as column_a, 2 as column_b
+"""
+
+
+models__online_incremental_sql = """
+{{
+  config(
+    materialized = "incremental",
+    as_columnstore = False,
+    indexes=[{'columns': ['column_a'], 'build_options': {'online': True}}],
+  )
+}}
+
+select 1 as column_a, 2 as column_b
+{% if is_incremental() %} where 1 = 0 {% endif %}
+"""
+
+
+class TestSQLServerOnlineResumableIndexes:
+    """ONLINE/RESUMABLE indexes are built in the materialization's post-commit
+    phase (outside any transaction), so they build correctly on both the create
+    and reconcile paths. The same post-commit placement keeps them transaction-
+    safe once dbt-managed transactions land; that flag-on path is exercised
+    separately when the transactions feature is present. RESUMABLE requires
+    ONLINE, so they pair."""
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "online_table.sql": models__online_table_sql,
+            "online_incr.sql": models__online_incremental_sql,
+        }
+
+    def test_table_create_path_post_commit(self, project, unique_schema):
+        results = run_dbt(["run", "--models", "online_table"])
+        assert len(results) == 1
+        first = get_index_rows(project, unique_schema, "online_table")
+        assert index_summary(first) == [
+            ("column_a", "nonclustered"),
+            ("column_b", "nonclustered"),
+        ]
+        # Idempotent: rebuilding keeps the same indexes (no churn).
+        first_names = sorted(row[0] for row in first)
+        results = run_dbt(["run", "--models", "online_table"])
+        assert len(results) == 1
+        second = get_index_rows(project, unique_schema, "online_table")
+        assert sorted(row[0] for row in second) == first_names
+
+    def test_incremental_reconcile_path_post_commit(self, project, unique_schema):
+        # First run: create path (post-commit build).
+        run_dbt(["run", "--models", "online_incr"])
+        first = get_index_rows(project, unique_schema, "online_incr")
+        assert index_summary(first) == [("column_a", "nonclustered")]
+        # Second run: table persists -> reconcile path runs; the online index is
+        # (re)built post-commit and persists.
+        run_dbt(["run", "--models", "online_incr"])
+        second = get_index_rows(project, unique_schema, "online_incr")
+        assert index_summary(second) == [("column_a", "nonclustered")]

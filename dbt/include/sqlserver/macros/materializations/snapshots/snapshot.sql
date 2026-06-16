@@ -121,6 +121,11 @@
   {% endif %}
 
   {{ run_hooks(post_hooks, inside_transaction=False) }}
+
+  {# Build any ONLINE/RESUMABLE indexes now the snapshot transaction has committed;
+     they cannot run inside a transaction. No-op when none are configured. #}
+  {% do sqlserver__create_indexes_post_commit(target_relation) %}
+
   {{ return({'relations': [target_relation]}) }}
 
 {% endmaterialization %}

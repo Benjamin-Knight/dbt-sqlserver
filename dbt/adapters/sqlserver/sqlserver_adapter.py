@@ -21,6 +21,7 @@ from dbt.adapters.relation_configs import RelationConfigChangeAction
 from dbt.adapters.sql.impl import CREATE_SCHEMA_MACRO_NAME, SQLAdapter
 from dbt.adapters.sqlserver.relation_configs import SQLServerIndexConfig, SQLServerIndexType
 from dbt.adapters.sqlserver.relation_configs.index import (
+    create_needs_own_batch,
     index_config_changes,
     normalize_drop_unmanaged,
 )
@@ -39,7 +40,6 @@ class SQLServerAdapter(SQLAdapter):
     Column = SQLServerColumn
     AdapterSpecificConfigs = SQLServerConfigs
     Relation = SQLServerRelation
-    AdapterSpecificConfigs = SQLServerConfigs
 
     _capabilities: CapabilityDict = CapabilityDict(
         {
@@ -300,6 +300,16 @@ class SQLServerAdapter(SQLAdapter):
         return SQLServerIndexConfig.parse(raw_index)
 
     @available
+    def index_needs_own_batch(self, raw_index: Any) -> bool:
+        """True when an index's build_options (ONLINE / RESUMABLE) require it to
+        be created outside any transaction. Such indexes are skipped by the
+        in-transaction create/reconcile paths and built in the materialization's
+        post-commit phase instead (sqlserver__create_indexes_post_commit). Single
+        source of truth for both the create and reconcile macros."""
+        parsed = self.parse_index(raw_index)
+        return bool(parsed and create_needs_own_batch(parsed.build_options))
+
+    @available
     def validate_indexes(
         self, raw_indexes: Any, as_columnstore: Any = False, drop_unmanaged: Any = False
     ) -> None:
@@ -336,8 +346,12 @@ class SQLServerAdapter(SQLAdapter):
         drop_unmanaged: Any = False,
     ) -> dict:
         """Diff existing indexes (agate table from sqlserver__describe_indexes)
-        against the model's `indexes` config. Returns jinja-friendly lists:
-        drops (names, apply first), creates (index config dicts), warnings."""
+        against the model's `indexes` config. Returns plain lists for jinja:
+        drops (index names), creates (index config dicts to build inside the
+        reconcile transaction), creates_no_txn (ONLINE/RESUMABLE creates that
+        must run as standalone autocommitted statements), warnings (strings).
+        Drops must be applied before creates (a replacement clustered index
+        needs its predecessor gone first)."""
         rows = []
         if existing_indexes is not None:
             column_names = existing_indexes.column_names
@@ -351,17 +365,24 @@ class SQLServerAdapter(SQLAdapter):
                 expected.append(parsed)
 
         changes, warnings = index_config_changes(rows, expected, relation, drop_unmanaged)
+
+        drops = []
+        creates = []
+        creates_no_txn = []
+        for change in changes:
+            if change.action == RelationConfigChangeAction.drop:
+                drops.append(change.context.name)
+            elif change.action == RelationConfigChangeAction.create:
+                node_config = change.context.as_node_config
+                if create_needs_own_batch(node_config.get("build_options")):
+                    creates_no_txn.append(node_config)
+                else:
+                    creates.append(node_config)
+
         return {
-            "drops": [
-                change.context.name
-                for change in changes
-                if change.action == RelationConfigChangeAction.drop
-            ],
-            "creates": [
-                change.context.as_node_config
-                for change in changes
-                if change.action == RelationConfigChangeAction.create
-            ],
+            "drops": drops,
+            "creates": creates,
+            "creates_no_txn": creates_no_txn,
             "warnings": warnings,
         }
 

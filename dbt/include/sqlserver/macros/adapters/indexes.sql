@@ -388,11 +388,17 @@
   {%- do adapter.validate_indexes(
       raw_indexes, as_columnstore, config.get('drop_unmanaged_indexes', default=false)
   ) -%}
+  {#- ONLINE / RESUMABLE indexes are skipped here and built in the post-commit
+      phase by sqlserver__create_indexes_post_commit: they cannot run inside a
+      transaction, and under dbt-managed transactions this create runs inside
+      dbt's model transaction. -#}
   {%- for _index_dict in raw_indexes %}
-    {%- set create_index_sql = get_create_index_sql(relation, _index_dict) -%}
-    {% if create_index_sql %}
-      {% do run_query(create_index_sql) %}
-    {% endif %}
+    {%- if not adapter.index_needs_own_batch(_index_dict) %}
+      {%- set create_index_sql = get_create_index_sql(relation, _index_dict) -%}
+      {% if create_index_sql %}
+        {% do run_query(create_index_sql) %}
+      {% endif %}
+    {%- endif %}
   {%- endfor %}
 {% endmacro %}
 
@@ -409,7 +415,17 @@
   {%- for warning in result['warnings'] %}
     {% do log("Index reconcile on " ~ relation ~ ": " ~ warning, info=true) %}
   {%- endfor %}
-  {#- apply all drops then creates as one transactional batch -#}
+  {#- Apply all drops and creates in ONE transactional batch: a definition
+      change is then atomic, with no window where a replacement index (or the
+      uniqueness it enforces) is missing for concurrent readers. xact_abort
+      guarantees rollback if any statement fails mid-batch.
+
+      The batch is @@TRANCOUNT-aware so it is correct whether or not dbt is
+      managing an outer transaction (dbt_sqlserver_use_dbt_transactions). With
+      no transaction open (autocommit, the default) it owns one; with dbt's
+      model transaction already open it joins that one instead of nesting, so
+      the reconcile commits / rolls back atomically with the model rather than
+      issuing a no-op nested COMMIT. -#}
   {%- set reconcile_statements = [] -%}
   {%- for index_name in result['drops'] %}
     {% do log("Dropping index " ~ index_name ~ " on " ~ relation, info=true) %}
@@ -420,9 +436,56 @@
   {%- endfor %}
   {% if reconcile_statements %}
     {% do run_query(
-        "set xact_abort on;\nbegin transaction;\n"
+        "set xact_abort on;\n"
+        ~ "declare @owns_txn bit = 0;\n"
+        ~ "if @@trancount = 0 begin begin transaction; set @owns_txn = 1; end;\n"
         ~ reconcile_statements | join(";\n")
-        ~ ";\ncommit transaction;"
+        ~ ";\nif @owns_txn = 1 commit transaction;"
     ) %}
+  {% endif %}
+  {#- ONLINE / RESUMABLE creates (result['creates_no_txn']) are intentionally NOT
+      built here: they cannot run inside a transaction, and under dbt-managed
+      transactions this reconcile runs inside dbt's model transaction. The
+      materialization builds them after commit via
+      sqlserver__create_indexes_post_commit. Any old definition of such an index
+      was already dropped in the batch above (its managed name is not in the
+      expected set), so the post-commit pass recreates it idempotently. -#}
+{% endmacro %}
+
+
+{% macro sqlserver__create_indexes_post_commit(relation) %}
+  {#-
+    Build the ONLINE / RESUMABLE indexes from the model config after the model
+    transaction has committed. SQL Server forbids these operations inside a
+    transaction, so they run here outside it: auto_begin=False keeps dbt from
+    opening one, and the leading guard commits anything the materialization (or
+    dbt's managed transaction) left open so the builds run at @@TRANCOUNT = 0.
+
+    Both the create path (fresh build) and the reconcile path skip ONLINE/
+    RESUMABLE inline and rely on this pass. Builds are idempotent (IF NOT EXISTS
+    in get_create_index_sql), so re-running is safe; they are not atomic with
+    the model (a brief window exists where a rebuilt index is absent), which is
+    inherent to non-blocking online/resumable builds.
+  -#}
+  {%- set raw_indexes = config.get('indexes', default=[]) -%}
+  {%- set online_indexes = [] -%}
+  {%- for _index_dict in raw_indexes %}
+    {%- if adapter.index_needs_own_batch(_index_dict) %}
+      {%- do online_indexes.append(_index_dict) -%}
+    {%- endif %}
+  {%- endfor %}
+  {% if online_indexes %}
+    {% call statement('online_index_guard', auto_begin=False) %}
+      if @@trancount > 0 commit transaction;
+    {% endcall %}
+    {%- for _index_dict in online_indexes %}
+      {%- set create_index_sql = sqlserver__get_create_index_sql(relation, _index_dict) -%}
+      {% if create_index_sql %}
+        {% do log("Building ONLINE/RESUMABLE index post-commit on " ~ relation, info=true) %}
+        {% call statement('online_index', auto_begin=False) %}
+          {{ create_index_sql }}
+        {% endcall %}
+      {% endif %}
+    {%- endfor %}
   {% endif %}
 {% endmacro %}

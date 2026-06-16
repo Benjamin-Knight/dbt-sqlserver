@@ -7,6 +7,8 @@
 - Add Postgres-style `indexes` model config for tables, incrementals, seeds and snapshots, covering most `CREATE INDEX` options. [#535](https://github.com/dbt-msft/dbt-sqlserver/issues/535)
 - Index names are deterministic definition hashes (`dbt_idx_` prefix); creation is idempotent and unchanged definitions are never rebuilt.
 - Reconcile indexes against the config on incremental, DML-refresh and snapshot runs, applied as one atomic batch. Constraint-backing, legacy post-hook and `as_columnstore` indexes are never dropped.
+- Index reconciliation uses an `@@TRANCOUNT`-aware batch: it owns its own transaction when none is open (autocommit, the default) and joins an existing one if dbt is managing the model transaction, so it stays correct either way.
+- `online` / `resumable` indexes are built in the materialization's post-commit phase so they never run inside a transaction (SQL Server forbids these operations in one). These builds are idempotent but not atomic with the model. Not supported on `seed` models when dbt manages the transaction, as dbt-core's seed materialization has no post-commit hook.
 - Index introspection reads the catalog lock-free throughout (`NOLOCK` on every `sys` view, not just `sys.indexes`), so it no longer queues behind concurrent index DDL.
 - Add `drop_unmanaged_indexes` config (`false` (default) / `warn` / `true`) for indexes dbt didn't create.
 - Validate cross-index config conflicts (multiple clustered indexes, clustered vs `as_columnstore`).
@@ -17,6 +19,12 @@
 - `prebuilt` trade-off, by design: during a rebuild the target is empty/loading with no backup copy; a failed rebuild leaves an empty or partial table (recovery: rerun with `--full-refresh`).
 - `prebuilt` drops the table before rebuilding, so `{{ this }}` self-references must be guarded by `{% if is_incremental() %}` (false during rebuilds); models with unguarded self-references must keep the default `heap_then_index`. The adapter detects an unguarded self-reference in the compiled SQL and fails the rebuild before anything is dropped.
 - Incremental full refreshes (both build methods) now mark the target with a `dbt_full_refresh_incomplete` extended property until they complete: a normal incremental run over a table whose last full refresh failed errors with instructions to rerun `--full-refresh`, instead of silently appending onto stale, empty or partial data. The `prebuilt` index config is also validated before the old table is dropped.
+
+### v1.10.1
+
+#### Bugfixes
+
+- Fix unit tests with empty fixtures (`rows: []`) generating invalid `limit 0` syntax; emit `top 0` instead. Also fix `get_columns_in_query()` for queries starting with a CTE, which broke unit tests with an empty `expect` block; such queries are now described via `sp_describe_first_result_set` instead of being executed. [#698](https://github.com/dbt-msft/dbt-sqlserver/issues/698)
 
 ### v1.10.0
 
