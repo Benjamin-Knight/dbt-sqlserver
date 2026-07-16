@@ -1,6 +1,6 @@
 {% macro sqlserver__create_clustered_columnstore_index(relation) -%}
     {%- set cci_name = (relation.schema ~ '_' ~ relation.identifier ~ '_cci') | replace(".", "") | replace(" ", "") -%}
-    {%- set relation_name = relation.schema ~ '_' ~ relation.identifier -%}
+    {%- set relation_name = relation.include(database=False) -%}
     {%- set full_relation = '"' ~ relation.schema ~ '"."' ~ relation.identifier ~ '"' -%}
     use [{{ relation.database }}];
     if EXISTS (
@@ -238,12 +238,27 @@
 {% endmacro %}
 
 
+{% macro sqlserver__server_major_version() -%}
+  {#- Detected engine major version: 13 = 2016, 14 = 2017, 15 = 2019,
+      16 = 2022, 17 = 2025. parsename() on the always-4-part productversion
+      works on every supported release, unlike
+      SERVERPROPERTY('ProductMajorVersion') which is 2014+ only. Returns none
+      outside an executing context (e.g. parse time). -#}
+  {%- if not execute -%}{{ return(none) }}{%- endif -%}
+  {%- set result = run_query(
+      "select cast(parsename(cast(serverproperty('productversion') as varchar(128)), 4) as int) as major_version"
+  ) -%}
+  {{ return(result.columns[0].values()[0]) }}
+{%- endmacro %}
+
+
 {% macro sqlserver__get_create_index_sql(relation, index_dict) -%}
   {%- set index_config = adapter.parse_index(index_dict) -%}
   {%- set index_name = index_config.render(relation) -%}
 
   {# Validations are made on the adapter class SQLServerIndexConfig to control resulting sql #}
-  {# names hash the full definition, so a same-named index is already correct: skip #}
+  {# Names are a deterministic hash of the full definition, so an existing #}
+  {# index with this name is already the index we want: skip, don't fail.  #}
   if not exists(select *
                   from sys.indexes {{ information_schema_hints() }}
                   where name = '{{ index_name }}'
@@ -273,6 +288,30 @@
     {% if index_config.where -%}
         where {{ index_config.where }}
     {% endif %}
+    {#- optimize_for_sequential_key, RESUMABLE and RESUMABLE's MAX_DURATION are
+        CREATE INDEX options that SQL Server only recognizes on 2019 (major 15)
+        and newer. This adapter still supports 2017/2016, so on older engines
+        they are dropped (with a warning) and the index is built without them,
+        rather than failing with "is not a recognized CREATE INDEX option".
+        ONLINE is intentionally kept: it is recognized on 2017 (edition-gated,
+        not version-gated). The server version is only queried when one of these
+        options is actually requested, so the common path adds no round-trip. -#}
+    {%- set v2019_only_build_options = ['resumable', 'max_duration'] -%}
+    {%- set _build_options = index_config.build_options or {} -%}
+    {%- set _wants_v2019_option = index_config.optimize_for_sequential_key
+          or _build_options.get('resumable') or _build_options.get('max_duration') -%}
+    {%- set drop_v2019_options = false -%}
+    {%- if _wants_v2019_option -%}
+        {%- set _major = sqlserver__server_major_version() -%}
+        {%- if _major is not none and _major < 15 -%}
+            {%- set drop_v2019_options = true -%}
+            {%- do log(
+                "Index [" ~ index_name ~ "] on " ~ relation ~ ": optimize_for_sequential_key"
+                ~ " / resumable require SQL Server 2019 (15.x) or newer; building the index"
+                ~ " without them on detected major version " ~ _major ~ ".", info=true
+            ) -%}
+        {%- endif -%}
+    {%- endif -%}
     {%- set with_options = [] -%}
     {%- if index_config.data_compression -%}
         {%- do with_options.append('data_compression = ' ~ index_config.data_compression | upper) -%}
@@ -286,14 +325,16 @@
     {%- if index_config.ignore_dup_key -%}
         {%- do with_options.append('ignore_dup_key = on') -%}
     {%- endif -%}
-    {%- if index_config.optimize_for_sequential_key -%}
+    {%- if index_config.optimize_for_sequential_key and not drop_v2019_options -%}
         {%- do with_options.append('optimize_for_sequential_key = on') -%}
     {%- endif -%}
     {%- if index_config.sort_in_tempdb -%}
         {%- do with_options.append('sort_in_tempdb = on') -%}
     {%- endif -%}
-    {%- for option_key, option_value in (index_config.build_options or {}).items() -%}
-        {%- if option_value is sameas true -%}
+    {%- for option_key, option_value in _build_options.items() -%}
+        {%- if drop_v2019_options and option_key in v2019_only_build_options -%}
+            {#- skipped: not recognized before SQL Server 2019 -#}
+        {%- elif option_value is sameas true -%}
             {%- do with_options.append(option_key ~ ' = on') -%}
         {%- elif option_value is sameas false -%}
             {%- do with_options.append(option_key ~ ' = off') -%}
@@ -331,11 +372,14 @@
         i.filter_definition as [where],
         i.fill_factor as [fillfactor],
         i.ignore_dup_key as [ignore_dup_key]
-        /* optimize_for_sequential_key not selected: sys.indexes column is 2019+ only */
+        /* optimize_for_sequential_key is deliberately not selected: the
+           sys.indexes column only exists on SQL Server 2019+ and managed
+           comparisons are name-based, so it isn't needed here */
     from sys.indexes i {{ information_schema_hints() }}
     outer apply (
-        /* STRING_AGG ... WITHIN GROUP requires SQL Server 2017+ */
-        select string_agg(col.[name], ', ') within group (order by ic.key_ordinal) as cols
+        /* STRING_AGG ... WITHIN GROUP requires SQL Server 2017+, the floor
+           of this adapter's CI matrix */
+        select string_agg(cast(col.[name] as nvarchar(max)), ', ') within group (order by ic.key_ordinal) as cols
         from sys.index_columns ic {{ information_schema_hints() }}
         inner join sys.columns col {{ information_schema_hints() }}
             on col.object_id = ic.object_id and col.column_id = ic.column_id
@@ -343,7 +387,7 @@
           and ic.is_included_column = 0
     ) key_cols
     outer apply (
-        select string_agg(col.[name], ', ') as cols
+        select string_agg(cast(col.[name] as nvarchar(max)), ', ') as cols
         from sys.index_columns ic {{ information_schema_hints() }}
         inner join sys.columns col {{ information_schema_hints() }}
             on col.object_id = ic.object_id and col.column_id = ic.column_id
@@ -351,7 +395,7 @@
           and ic.is_included_column = 1
     ) incl_cols
     outer apply (
-        select string_agg(col.[name], ', ') as cols
+        select string_agg(cast(col.[name] as nvarchar(max)), ', ') as cols
         from sys.index_columns ic {{ information_schema_hints() }}
         inner join sys.columns col {{ information_schema_hints() }}
             on col.object_id = ic.object_id and col.column_id = ic.column_id
@@ -359,7 +403,8 @@
           and ic.is_descending_key = 1
     ) desc_cols
     outer apply (
-        /* MAX(): deterministic across partitions */
+        /* MAX() rather than TOP 1: deterministic if partitions ever carry
+           mixed compression (the adapter doesn't manage partitioning today) */
         select max(p.data_compression_desc) as data_compression_desc
         from sys.partitions p {{ information_schema_hints() }}
         where p.object_id = i.object_id and p.index_id = i.index_id
@@ -378,9 +423,12 @@
 
 
 {% macro sqlserver__create_indexes(relation) %}
-  {#- dbt-adapters override: validate the index set as a whole before
-      creating anything (as_columnstore only applies to materializations
-      that build via create_table_as, so not seeds) -#}
+  {#-
+    Override of the dbt-adapters default to validate the index set as a whole
+    (at most one clustered; clustered rowstore vs as_columnstore conflict)
+    before creating anything. as_columnstore is only honored by
+    create_table_as, so it is irrelevant for seeds despite defaulting true.
+  -#}
   {%- set raw_indexes = config.get('indexes', default=[]) -%}
   {%- set materialized = config.get('materialized') -%}
   {%- set as_columnstore = config.get('as_columnstore', default=true)
@@ -404,9 +452,15 @@
 
 
 {% macro sqlserver__reconcile_indexes(relation) %}
-  {#- converge a persisting relation on its configured index set -#}
+  {#-
+    Converge an existing relation on its configured index set. Called on the
+    paths where the relation persists across runs (incremental non-full-
+    refresh, dml table refresh, snapshot updates), where create_indexes alone
+    would let config changes drift.
+  -#}
   {%- set raw_indexes = config.get('indexes', default=[]) -%}
   {%- set drop_unmanaged = config.get('drop_unmanaged_indexes', default=false) -%}
+  {#- all three callers (incremental, dml refresh, snapshot) honor as_columnstore -#}
   {%- do adapter.validate_indexes(
       raw_indexes, config.get('as_columnstore', default=true), drop_unmanaged
   ) -%}

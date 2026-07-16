@@ -28,7 +28,7 @@ repos:
           - '-d {extends: default, rules: {line-length: disable, document-start: disable}}'
           - '-s'
   - repo: 'https://github.com/astral-sh/ruff-pre-commit'
-    rev: v0.15.17
+    rev: v0.15.20
     hooks:
       - id: ruff-check
         args:
@@ -43,7 +43,7 @@ repos:
       - id: black
         args:
           - '--line-length=99'
-          - '--target-version=py39'
+          - '--target-version=py310'
       - id: black
         alias: black-check
         stages:

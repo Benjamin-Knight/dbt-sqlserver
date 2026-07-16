@@ -54,14 +54,19 @@
     {%- set column_list = target_columns | map(attribute='quoted') | join(', ') -%}
 
     {# Atomic DML swap — RCSI protects concurrent readers #}
-    {# dbt-sqlserver uses autocommit=True and add_begin_query/add_commit_query #}
-    {# are no-ops, so this creates a simple (non-nested) transaction. #}
+    {# When dbt_sqlserver_use_dbt_transactions is off (default), autocommit #}
+    {# means we need the explicit BEGIN/COMMIT. When the flag is on, dbt #}
+    {# already wraps the statement call in a transaction, so skip it. #}
     {% call statement('dml_refresh_swap') -%}
+      {% if not adapter.behavior.dbt_sqlserver_use_dbt_transactions %}
       BEGIN TRANSACTION;
+      {% endif %}
       DELETE FROM {{ target_relation }};
       INSERT INTO {{ target_relation }} ({{ column_list }})
         SELECT {{ column_list }} FROM {{ refresh_relation }};
+      {% if not adapter.behavior.dbt_sqlserver_use_dbt_transactions %}
       COMMIT TRANSACTION;
+      {% endif %}
     {%- endcall %}
 
     {# Cleanup scratch table #}
@@ -69,7 +74,8 @@
       DROP TABLE IF EXISTS {{ refresh_relation }};
     {%- endcall %}
 
-    {# converge the persisted target's indexes on the config #}
+    {# The target table persisted (no rebuild), so converge its indexes on
+       the config. Runs after the swap's self-contained transaction. #}
     {% do sqlserver__reconcile_indexes(target_relation) %}
 
   {% else %}

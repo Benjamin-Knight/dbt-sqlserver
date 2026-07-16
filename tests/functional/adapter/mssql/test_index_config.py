@@ -491,7 +491,9 @@ class TestSQLServerIndex:
             assert indexes == expected
 
     def test_table_indexes_stable_across_runs(self, project, unique_schema):
-        # rebuilds must produce identical index names and definitions
+        # Deterministic naming: a rebuild must produce the same index *names*
+        # (reconciliation relies on name equality <=> definition equality),
+        # and the definition set must never accumulate.
         results = run_dbt(["run", "--models", "table"])
         assert len(results) == 1
         first_names = self.get_index_names("table", project, unique_schema)
@@ -507,7 +509,8 @@ class TestSQLServerIndex:
         assert len(first_defs) == 5
 
     def test_table_reserved_word_columns(self, project, unique_schema):
-        # key and include columns are bracket-quoted (reserved words)
+        # Index key and included columns must be bracket-quoted: this model
+        # indexes columns named after T-SQL reserved words.
         results = run_dbt(["run", "--models", "table_reserved"])
         assert len(results) == 1
 
@@ -679,6 +682,27 @@ from (
 
 SET_B = "[{'columns': ['column_b'], 'type': 'nonclustered'}]"
 
+# A wide table whose clustered columnstore index (as_columnstore defaults True)
+# spans every column. With ~200 columns of ~45 chars each, the column-name list
+# aggregated by sqlserver__describe_indexes is ~18 KB as nvarchar, past
+# STRING_AGG's 8000-byte result cap.
+WIDE_COLUMNSTORE_COLUMN_COUNT = 200
+_wide_columnstore_columns = ",\n  ".join(
+    f"{i} as wide_column_{i:03d}_with_a_reasonably_long_name"
+    for i in range(WIDE_COLUMNSTORE_COLUMN_COUNT)
+)
+models__wide_columnstore_sql = f"""
+{{{{
+  config(
+    materialized = "incremental",
+    as_columnstore = True,
+  )
+}}}}
+
+select
+  {_wide_columnstore_columns}
+"""
+
 
 def get_index_rows(project, unique_schema, table_name):
     sql = indexes_def.format(schema_name=unique_schema, table_name=table_name)
@@ -752,6 +776,36 @@ class TestSQLServerIndexReconciliationDML:
         assert index_summary(second) == [("column_b", "nonclustered")]
 
 
+class TestSQLServerWideColumnstoreReconcile:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {"wide_columnstore.sql": models__wide_columnstore_sql}
+
+    def test_wide_columnstore_reconcile_does_not_overflow(self, project, unique_schema):
+        # First run creates the wide table plus its clustered columnstore index.
+        run_dbt(["run", "--models", "wide_columnstore"])
+
+        # The second (non-full-refresh) run reconciles indexes, describing the
+        # existing columnstore index over all its columns.
+        results = run_dbt(["run", "--models", "wide_columnstore"])
+        assert len(results) == 1
+
+        # The clustered columnstore index (type 5) survives reconciliation.
+        cci_count = project.run_sql(
+            f"""
+            select count(*)
+            from sys.indexes i
+            join sys.objects o on o.object_id = i.object_id
+            join sys.schemas s on s.schema_id = o.schema_id
+            where s.name = '{unique_schema}'
+              and o.name = 'wide_columnstore'
+              and i.[type] = 5
+            """,
+            fetch="one",
+        )[0]
+        assert cci_count == 1
+
+
 class TestSQLServerDropUnmanagedIndexes:
     @pytest.fixture(scope="class")
     def models(self):
@@ -771,7 +825,7 @@ class TestSQLServerDropUnmanagedIndexes:
         run_dbt(["run", "--models", "drop_unmanaged"])
         self.seed_out_of_band_indexes(project, unique_schema)
 
-        # default (false): managed orphan swept, everything else kept
+        # Default (false): managed orphan swept, everything else kept.
         run_dbt(["run", "--models", "drop_unmanaged"])
         names = self.names(project, unique_schema)
         assert "dbt_idx_orphan" not in names
@@ -980,7 +1034,9 @@ select 1 as column_a, 2 as column_b
 
 
 class TestSQLServerProjectLevelIndexes:
-    """dbt_project.yml model-scope indexes apply; model-level config clobbers them."""
+    """indexes set as keys in dbt_project.yml (models scope) must behave the
+    same as in-model config, and a model-level indexes config must fully
+    replace (clobber, not merge) the project-level list."""
 
     @pytest.fixture(scope="class")
     def models(self):
@@ -1141,3 +1197,72 @@ class TestSQLServerOnlineResumableIndexes:
         run_dbt(["run", "--models", "online_incr"])
         second = get_index_rows(project, unique_schema, "online_incr")
         assert index_summary(second) == [("column_a", "nonclustered")]
+
+
+models__managed_index_key_include_boundary_sql = """
+{{
+  config(
+    materialized = "table",
+    as_columnstore = False,
+    indexes = var('managed_idx', [])
+  )
+}}
+
+select cast(1 as int) as a, cast(2 as int) as b, cast(3 as int) as c
+"""
+
+
+class TestSQLServerManagedNameKeyIncludeBoundary:
+    """Regression: columns=['a','b'] and columns=['a'] with
+    included_columns=['b'] must produce different managed names so that
+    reconciliation drops and recreates the index when the definition
+    changes."""
+
+    MODEL = "managed_index_key_include_boundary"
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {f"{self.MODEL}.sql": models__managed_index_key_include_boundary_sql}
+
+    def _managed_index_rows(self, project, unique_schema):
+        """Return only dbt_idx_ rows for the test table."""
+        sql = indexes_def.format(schema_name=unique_schema, table_name=self.MODEL)
+        all_rows = project.run_sql(sql, fetch="all")
+        return [r for r in all_rows if r[0] and r[0].startswith("dbt_idx_")]
+
+    def test_managed_name_changes_when_columns_moved_to_included(self, project, unique_schema):
+        # ---- Step 1: create with key-only index (columns: ["a", "b"]) ----
+        run_dbt(
+            [
+                "run",
+                "--vars",
+                "managed_idx: [{'columns': ['a', 'b']}]",
+            ]
+        )
+        rows1 = self._managed_index_rows(project, unique_schema)
+        assert len(rows1) == 1, f"Expected exactly one managed index, got {len(rows1)}"
+        name1, cols1, inc1 = rows1[0][0], rows1[0][1], rows1[0][2]
+        assert cols1 == "a, b", f"Expected key columns 'a, b' after first run, got {cols1!r}"
+        assert inc1 is None, f"Expected no included columns after first run, got {inc1!r}"
+
+        # ---- Step 2: change config to key+include index ----
+        run_dbt(
+            [
+                "run",
+                "--vars",
+                "managed_idx: [{'columns': ['a'], 'included_columns': ['b']}]",
+            ]
+        )
+        rows2 = self._managed_index_rows(project, unique_schema)
+        assert len(rows2) == 1, f"Expected exactly one managed index, got {len(rows2)}"
+        name2, cols2, inc2 = rows2[0][0], rows2[0][1], rows2[0][2]
+        assert cols2 == "a", f"Expected key column 'a' after second run, got {cols2!r}"
+        assert inc2 == "b", f"Expected included column 'b' after second run, got {inc2!r}"
+
+        # ---- Step 3: verify managed names differ ----
+        assert name1 != name2, (
+            "Managed index name must change when the definition changes: "
+            "columns=['a','b'] -> columns=['a'] with included_columns=['b']. "
+            "If this assertion fails the hash/name generation does not "
+            "distinguish key columns from included columns."
+        )
