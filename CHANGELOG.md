@@ -10,6 +10,7 @@
 - `prebuilt` trade-off, by design: during a rebuild the target is empty/loading with no backup copy; a failed rebuild leaves an empty or partial table (recovery: rerun with `--full-refresh`).
 - `prebuilt` drops the table before rebuilding, so `{{ this }}` self-references must be guarded by `{% if is_incremental() %}` (false during rebuilds); models with unguarded self-references must keep the default `heap_then_index`. The adapter detects an unguarded self-reference in the compiled SQL and fails the rebuild before anything is dropped.
 - Incremental full refreshes (both build methods) now mark the target with a `dbt_full_refresh_incomplete` extended property until they complete: a normal incremental run over a table whose last full refresh failed errors with instructions to rerun `--full-refresh`, instead of silently appending onto stale, empty or partial data. The `prebuilt` index config is also validated before the old table is dropped.
+- Apply Dynamic Data Masking on the `full_refresh_build: prebuilt` rebuild path. `prebuilt` drops and recreates the table, so it now re-applies configured `masks` / `masked_with` like every other build path (previously they were silently lost on each rebuild). Masks are applied after the load but before `create_indexes`, so a mask on a nonclustered-index key column lands before that index exists; a CCI is maskable freely, and a mask on a clustered *rowstore* key column (already built by the prebuilt load) fails with a clear index-key error (recovery: use the default `heap_then_index`).
 
 ### v1.10.1
 
