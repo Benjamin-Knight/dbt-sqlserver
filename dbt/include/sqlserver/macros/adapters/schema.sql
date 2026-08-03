@@ -1,9 +1,9 @@
 {% macro sqlserver__create_schema(relation) -%}
   {% call statement('create_schema') -%}
-    USE [{{ relation.database }}];
+    {{ get_use_database_sql(relation.database) }}
     IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = '{{ relation.schema }}')
     BEGIN
-    EXEC('CREATE SCHEMA [{{ relation.schema }}]')
+    EXEC('CREATE SCHEMA {{ adapter.quote(relation.schema) }}')
     END
   {% endcall %}
 {% endmacro %}
@@ -13,7 +13,7 @@
     {{ get_use_database_sql(relation.database) }}
     IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = '{{ relation.schema }}')
     BEGIN
-    EXEC('CREATE SCHEMA [{{ relation.schema }}] AUTHORIZATION [{{ schema_authorization }}]')
+    EXEC('CREATE SCHEMA {{ adapter.quote(relation.schema) }} AUTHORIZATION {{ adapter.quote(schema_authorization) }}')
     END
   {% endcall %}
 {% endmacro %}
@@ -61,6 +61,11 @@
     {%- if adapter.behavior.dbt_sqlserver_use_default_schema_concat -%}
         {{ default__generate_schema_name(custom_schema_name, node) }}
     {%- elif var('dbt_sqlserver_use_default_schema_concat', false) -%}
+        {{ exceptions.warn(
+            "DEPRECATED: Using `vars.dbt_sqlserver_use_default_schema_concat` is deprecated. "
+            "Use `flags.dbt_sqlserver_use_default_schema_concat` in dbt_project.yml instead. "
+            "Support for the `var` fallback will be removed in a future release."
+        ) }}
         {{ default__generate_schema_name(custom_schema_name, node) }}
     {%- else -%}
         {%- set default_schema = target.schema -%}

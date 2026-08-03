@@ -265,6 +265,48 @@ def test_connection_keys_do_not_mutate_authentication() -> None:
     assert credentials.authentication == original_authentication
 
 
+def test_sqlserver_backend_adbc_enum_member_exists() -> None:
+    """ADBC backend must be a recognised member of SQLServerBackend."""
+    assert str(SQLServerBackend.adbc) == "adbc"
+
+
+def test_coerce_backend_accepts_adbc() -> None:
+    """coerce_backend('adbc') must return SQLServerBackend.adbc."""
+    from dbt.adapters.sqlserver.sqlserver_credentials import coerce_backend
+
+    assert coerce_backend("adbc") is SQLServerBackend.adbc
+
+
+def test_coerce_backend_rejects_unknown_with_adbc_in_message() -> None:
+    """coerce_backend('unknown') must raise DbtRuntimeError mentioning adbc."""
+    from dbt.adapters.sqlserver.sqlserver_credentials import coerce_backend
+
+    with pytest.raises(DbtRuntimeError, match="adbc"):
+        coerce_backend("unknown")
+
+
+def test_supported_backends_includes_adbc() -> None:
+    """SUPPORTED_SQLSERVER_BACKENDS must include 'adbc'."""
+    from dbt.adapters.sqlserver.sqlserver_constants import SUPPORTED_SQLSERVER_BACKENDS
+
+    assert "adbc" in SUPPORTED_SQLSERVER_BACKENDS
+
+
+def test_connection_keys_exclude_driver_for_adbc() -> None:
+    """adbc backend must not include 'driver' in connection keys (like mssql-python)."""
+    adbc_credentials = SQLServerCredentials(
+        backend=SQLServerBackend.adbc,
+        driver="ODBC Driver 18 for SQL Server",
+        host="fake.sql.sqlserver.net",
+        database="dbt",
+        schema="sqlserver",
+    )
+
+    assert "driver" not in adbc_credentials._connection_keys()
+    assert "windows_login" in adbc_credentials._connection_keys()
+    assert "backend" in adbc_credentials._connection_keys()
+
+
 def test_connection_keys_include_driver_only_for_pyodbc() -> None:
     pyodbc_credentials = SQLServerCredentials(
         backend=SQLServerBackend.pyodbc,
@@ -285,6 +327,28 @@ def test_connection_keys_include_driver_only_for_pyodbc() -> None:
     assert "driver" not in mssql_python_credentials._connection_keys()
     assert "windows_login" in pyodbc_credentials._connection_keys()
     assert "windows_login" in mssql_python_credentials._connection_keys()
+
+
+def test_xact_abort_defaults_to_true() -> None:
+    credentials = SQLServerCredentials(
+        driver="ODBC Driver 18 for SQL Server",
+        host="fake.sql.sqlserver.net",
+        database="dbt",
+        schema="sqlserver",
+    )
+
+    assert credentials.xact_abort is True
+
+
+def test_connection_keys_include_xact_abort() -> None:
+    credentials = SQLServerCredentials(
+        driver="ODBC Driver 18 for SQL Server",
+        host="fake.sql.sqlserver.net",
+        database="dbt",
+        schema="sqlserver",
+    )
+
+    assert "xact_abort" in credentials._connection_keys()
 
 
 def test_is_pyodbc_handle_false_for_mssql_python_handle() -> None:
@@ -621,12 +685,33 @@ def test_exception_handler_routes_backend_database_errors_without_falling_throug
         reset_runtime_state_for_test()
 
 
-def test_data_type_code_to_name_handles_repr_and_rejects_integer_codes() -> None:
+def test_data_type_code_to_name_handles_repr_and_arrow_codes() -> None:
+    # Existing pyodbc / mssql-python string repr handling still works.
     assert SQLServerConnectionManager.data_type_code_to_name("<class 'str'>") == "varchar"
     assert SQLServerConnectionManager.data_type_code_to_name("int") == "int"
 
-    with pytest.raises(DbtRuntimeError, match="integer type codes are not mapped"):
-        SQLServerConnectionManager.data_type_code_to_name(7)
+    # Arrow integer type codes (ADBC path).
+    assert SQLServerConnectionManager.data_type_code_to_name(1) == "bit"  # bool_
+    assert SQLServerConnectionManager.data_type_code_to_name(3) == "varchar"  # string / utf8
+    assert SQLServerConnectionManager.data_type_code_to_name(8) == "int"  # int32
+    assert SQLServerConnectionManager.data_type_code_to_name(7) == "float"  # float64
+    assert SQLServerConnectionManager.data_type_code_to_name(17) == "datetime2(6)"  # timestamp
+    assert SQLServerConnectionManager.data_type_code_to_name(10) == "smallint"  # int8
+    assert SQLServerConnectionManager.data_type_code_to_name(5) == "varchar(max)"  # large_string
+
+    # Unrecognised Arrow integer code raises rather than silently
+    # mis-reporting the column type.
+    with pytest.raises(DbtRuntimeError, match="99"):
+        SQLServerConnectionManager.data_type_code_to_name(99)
+
+    # Arrow string type names (ADBC path).
+    assert SQLServerConnectionManager.data_type_code_to_name("int32") == "int"
+    assert SQLServerConnectionManager.data_type_code_to_name("utf8") == "varchar"
+    assert SQLServerConnectionManager.data_type_code_to_name("timestamp") == "datetime2(6)"
+
+    # Unknown string codes still raise on the non-ADBC path.
+    with pytest.raises(DbtRuntimeError, match="no matching entry found"):
+        SQLServerConnectionManager.data_type_code_to_name("nonexistent_type")
 
 
 def test_mssql_python_active_directory_default_passes() -> None:
@@ -859,6 +944,13 @@ def test_open_with_mssql_python_backend_system_assigned_msi_passes_connection_st
     class FakeHandle:
         def __init__(self):
             self.timeout = None
+            self.autocommit = True
+
+        def cursor(self):
+            return SimpleNamespace(execute=lambda sql: None, close=lambda: None)
+
+        def close(self):
+            pass
 
     def fake_connect(connection_string, autocommit, timeout):
         captured["connection_string"] = connection_string
@@ -1196,6 +1288,42 @@ def _fake_pyodbc_module(connect):
     )
 
 
+class _FakeSessionCursor:
+    def __init__(self, fail: bool = False):
+        self.executed: List[str] = []
+        self.closed = False
+        self._fail = fail
+
+    def execute(self, sql):
+        if self._fail:
+            raise RuntimeError("boom")
+        self.executed.append(sql)
+
+    def close(self):
+        self.closed = True
+
+
+class _FakeSessionHandle:
+    """Minimal handle standing in for a pyodbc/mssql-python connection,
+    covering just the surface _apply_session_settings touches."""
+
+    def __init__(self, autocommit: bool = True, fail_execute: bool = False):
+        self.autocommit = autocommit
+        self.timeout = None
+        self.cursor_obj = _FakeSessionCursor(fail=fail_execute)
+        self.commit_calls = 0
+        self.closed = False
+
+    def cursor(self):
+        return self.cursor_obj
+
+    def commit(self):
+        self.commit_calls += 1
+
+    def close(self):
+        self.closed = True
+
+
 def test_open_with_mssql_python_backend_enables_pooling(
     credentials: SQLServerCredentials, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1215,6 +1343,13 @@ def test_open_with_mssql_python_backend_enables_pooling(
     class FakeHandle:
         def __init__(self):
             self.timeout = None
+            self.autocommit = True
+
+        def cursor(self):
+            return SimpleNamespace(execute=lambda sql: None, close=lambda: None)
+
+        def close(self):
+            pass
 
     fake_handle = FakeHandle()
 
@@ -1348,6 +1483,13 @@ def test_open_with_mssql_python_backend_supported_managed_identity_auth(
     class FakeHandle:
         def __init__(self):
             self.timeout = None
+            self.autocommit = True
+
+        def cursor(self):
+            return SimpleNamespace(execute=lambda sql: None, close=lambda: None)
+
+        def close(self):
+            pass
 
     def fake_connect(connection_string, autocommit, timeout):
         captured["connection_string"] = connection_string
@@ -1447,6 +1589,13 @@ def test_open_with_pyodbc_backend_enables_driver_pooling(
     class FakeHandle:
         def __init__(self):
             self.timeout = None
+            self.autocommit = True
+
+        def cursor(self):
+            return SimpleNamespace(execute=lambda sql: None, close=lambda: None)
+
+        def close(self):
+            pass
 
     def fake_connect(connection_string, attrs_before, autocommit, timeout):
         captured["connection_string"] = connection_string
@@ -1474,6 +1623,125 @@ def test_open_with_pyodbc_backend_enables_driver_pooling(
     assert captured["autocommit"] is True
     assert captured["timeout"] == credentials.login_timeout
     assert "Pooling=true" in captured["connection_string"]
+
+
+def _open_with_fake_handle(
+    credentials: SQLServerCredentials,
+    monkeypatch: pytest.MonkeyPatch,
+    handle: _FakeSessionHandle,
+) -> Connection:
+    fake_pyodbc = _fake_pyodbc_module(lambda *args, **kwargs: handle)
+
+    reset_runtime_state_for_test()
+    configure_runtime_state_for_test(pyodbc_module=fake_pyodbc, pyodbc_import_error=None)
+    monkeypatch.setattr(
+        SQLServerConnectionManager,
+        "retry_connection",
+        classmethod(_fake_retry_connection_stub()),
+    )
+
+    connection = Connection(type="sqlserver", name="pyodbc-test", credentials=credentials)
+    return SQLServerConnectionManager.open(connection)
+
+
+def test_open_applies_xact_abort_session_setting_by_default(
+    credentials: SQLServerCredentials,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credentials.UID = "dbt_user"
+    credentials.PWD = "super-secret"
+    assert credentials.xact_abort is True
+
+    handle = _FakeSessionHandle(autocommit=True)
+    opened = _open_with_fake_handle(credentials, monkeypatch, handle)
+
+    assert opened.state == ConnectionState.OPEN
+    assert handle.cursor_obj.executed == ["SET XACT_ABORT ON;"]
+    assert handle.cursor_obj.closed is True
+    assert handle.commit_calls == 0
+
+
+def test_open_commits_after_session_settings_when_handle_not_autocommit(
+    credentials: SQLServerCredentials,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credentials.UID = "dbt_user"
+    credentials.PWD = "super-secret"
+
+    handle = _FakeSessionHandle(autocommit=False)
+    opened = _open_with_fake_handle(credentials, monkeypatch, handle)
+
+    assert opened.state == ConnectionState.OPEN
+    assert handle.cursor_obj.executed == ["SET XACT_ABORT ON;"]
+    assert handle.commit_calls == 1
+
+
+def test_open_skips_session_settings_and_warns_once_when_xact_abort_disabled(
+    credentials: SQLServerCredentials,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    credentials.UID = "dbt_user"
+    credentials.PWD = "super-secret"
+    credentials.xact_abort = False
+
+    handle = _FakeSessionHandle(autocommit=True)
+    monkeypatch.setattr(sqlserver_connections, "_xact_abort_warning_logged", False)
+
+    with patch("dbt.adapters.sqlserver.sqlserver_connections.logger") as mock_logger:
+        opened = _open_with_fake_handle(credentials, monkeypatch, handle)
+
+    assert opened.state == ConnectionState.OPEN
+    assert handle.cursor_obj.executed == []
+    assert handle.commit_calls == 0
+    mock_logger.warning.assert_called_once()
+
+
+def test_apply_session_settings_closes_connection_and_reraises_on_failure(
+    credentials: SQLServerCredentials,
+) -> None:
+    handle = _FakeSessionHandle(autocommit=True, fail_execute=True)
+    connection = Connection(type="sqlserver", name="pyodbc-test", credentials=credentials)
+    connection.handle = handle
+    connection.state = ConnectionState.OPEN
+
+    with pytest.raises(RuntimeError, match="boom"):
+        SQLServerConnectionManager._apply_session_settings(connection)
+
+    assert handle.closed is True
+    assert connection.handle is None
+    assert connection.state == ConnectionState.FAIL
+
+
+def test_warn_xact_abort_disabled_once_fires_only_once_per_process(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sqlserver_connections, "_xact_abort_warning_logged", False)
+    monkeypatch.setattr(SQLServerConnectionManager, "_dbt_sqlserver_use_dbt_transactions", False)
+
+    with patch("dbt.adapters.sqlserver.sqlserver_connections.logger") as mock_logger:
+        SQLServerConnectionManager._warn_xact_abort_disabled_once()
+        SQLServerConnectionManager._warn_xact_abort_disabled_once()
+
+    mock_logger.warning.assert_called_once()
+
+
+@pytest.mark.parametrize("use_dbt_transactions", [True, False])
+def test_warn_xact_abort_disabled_once_mentions_dbt_transactions_state(
+    monkeypatch: pytest.MonkeyPatch,
+    use_dbt_transactions: bool,
+) -> None:
+    monkeypatch.setattr(sqlserver_connections, "_xact_abort_warning_logged", False)
+    monkeypatch.setattr(
+        SQLServerConnectionManager, "_dbt_sqlserver_use_dbt_transactions", use_dbt_transactions
+    )
+
+    with patch("dbt.adapters.sqlserver.sqlserver_connections.logger") as mock_logger:
+        SQLServerConnectionManager._warn_xact_abort_disabled_once()
+
+    message = mock_logger.warning.call_args[0][0]
+    assert str(use_dbt_transactions) in message
+    if not use_dbt_transactions:
+        assert "DML refresh" in message
 
 
 @pytest.mark.parametrize("flag_value", [True, False])

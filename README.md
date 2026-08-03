@@ -2,8 +2,19 @@
 
 [dbt](https://www.getdbt.com) adapter for Microsoft SQL Server and Azure SQL services.
 
-The adapter supports dbt-core 1.10 or newer and follows the same versioning scheme.
-E.g. version 1.10.x of the adapter is compatible with dbt-core 1.10.x.
+The adapter supports dbt-core 1.11 or newer and follows the same versioning scheme.
+E.g. version 1.11.x of the adapter is compatible with dbt-core 1.11.x.
+
+## Supported Python versions
+
+The adapter is tested against:
+
+| Python version | Status |
+|---|---|
+| 3.10 | Installable (not tested in CI) |
+| 3.11 | Officially supported |
+| 3.12 | Officially supported |
+| 3.13 | Officially supported |
 
 ## Supported SQL Server versions
 
@@ -43,6 +54,7 @@ Latest pre-release: ![GitHub tag (latest SemVer pre-release)](https://img.shield
 |---|---|---|
 | `pyodbc` | `dbt-sqlserver[pyodbc]` or `pyodbc` | `unixodbc-dev` plus the Microsoft ODBC Driver for SQL Server |
 | `mssql-python` | `dbt-sqlserver[mssql]` or `mssql-python` | `libltdl7`, `libkrb5-3`, `libgssapi-krb5-2` |
+| `adbc` *(experimental)* | `dbt-sqlserver[adbc]` | none (driver binary installed separately via the `dbc` CLI) |
 
 
 ### `pyodbc` backend
@@ -107,6 +119,16 @@ your_profile:
       backend: mssql-python  # <-- enables this backend
 ```
 
+### `adbc` backend *(experimental)*
+
+An Arrow-native backend built on [ADBC](https://arrow.apache.org/adbc/), avoiding the row-based ODBC/DB-API bridge entirely. SQL Server authentication only (no Azure AD / Windows auth yet).
+
+```shell
+pip install -U "dbt-sqlserver[adbc]"
+```
+
+The driver binary is not on PyPI and must be installed once via the `dbc` CLI. See [docs/adbc_backend.md](docs/adbc_backend.md) for the full setup, configuration, and known-differences guide.
+
 ## Changelog
 
 See [the changelog](CHANGELOG.md)
@@ -140,7 +162,7 @@ The same setting is also honoured via `vars:` for backwards compatibility; the b
 
 ### `backend`
 
-*(default: `pyodbc`)* Set to `mssql-python` in a profile target to use the `mssql-python` backend instead of `pyodbc`. The adapter fails if the required backend package (Python dependency), such as `pyodbc` or `mssql-python`, is not installed.
+*(default: `pyodbc`)* Set to `mssql-python` or `adbc` (experimental, see [docs/adbc_backend.md](docs/adbc_backend.md)) in a profile target to use that backend instead of `pyodbc`. The adapter fails if the required backend package (Python dependency), such as `pyodbc`, `mssql-python`, or `adbc-driver-manager`, is not installed.
 
 ### `dbt_sqlserver_enable_safe_type_expansion`
 
@@ -169,6 +191,25 @@ This mode is opt-in and should be tested carefully with project-specific materia
 flags:
   dbt_sqlserver_enable_safe_type_expansion: true
   dbt_sqlserver_use_dbt_transactions: true # <-- opt-in; default is false
+```
+
+### `xact_abort`
+
+*(default: `true`)* Profile/connection field. When enabled, the adapter runs `SET XACT_ABORT ON;` once per connection, right after it opens. With `XACT_ABORT ON`, a run-time error partway through a multi-statement batch (e.g. a `NOT NULL`/constraint violation during the DML table refresh's DELETE+INSERT swap) aborts the whole batch and rolls back any open transaction, instead of only aborting the failing statement and letting a trailing `COMMIT` persist a partial result. See [#718](https://github.com/dbt-msft/dbt-sqlserver/issues/718).
+
+This is independent of `dbt_sqlserver_use_dbt_transactions` above: that flag decides who owns the transaction boundary (dbt vs. the driver's autocommit), while `xact_abort` decides how the server reacts to a run-time error mid-batch. `XACT_ABORT ON` matters even when there is no explicit transaction at all, which is exactly the configuration `dbt_sqlserver_use_dbt_transactions` offers no protection in — so the two settings are not derived from one another and both need to be considered independently.
+
+Turn it off only if a project intentionally relies on continue-on-error batch semantics (e.g. a hook that expects one failing statement in a batch not to abort the rest):
+
+```yaml
+# profiles.yml
+your_profile:
+  target: dev
+  outputs:
+    dev:
+      type: sqlserver
+      # ...
+      xact_abort: false # <-- opt-out; default is true
 ```
 
 ### `column_type_expansion_max_rows`

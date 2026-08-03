@@ -8,6 +8,7 @@ from dbt.adapters.contracts.connection import Credentials
 from dbt.adapters.sqlserver.sqlserver_auth import normalize_authentication_key
 from dbt.adapters.sqlserver.sqlserver_constants import (
     MSSQL_AUTH_ACTIVE_DIRECTORY_SERVICE_PRINCIPAL,
+    SQLSERVER_BACKEND_ADBC,
     SQLSERVER_BACKEND_MSSQL_PYTHON,
     SQLSERVER_BACKEND_PYODBC,
     SUPPORTED_SQLSERVER_BACKENDS_MESSAGE,
@@ -18,6 +19,7 @@ from dbt.adapters.sqlserver.sqlserver_helpers import normalize_query_timeout
 class SQLServerBackend(StrEnum):
     pyodbc = SQLSERVER_BACKEND_PYODBC
     mssql_python = SQLSERVER_BACKEND_MSSQL_PYTHON
+    adbc = SQLSERVER_BACKEND_ADBC
 
 
 DEFAULT_SQLSERVER_BACKEND = cast(SQLServerBackend, SQLServerBackend.pyodbc)
@@ -56,6 +58,7 @@ class SQLServerCredentials(Credentials):
     schema_authorization: Optional[str] = None
     login_timeout: Optional[int] = 0
     query_timeout: Optional[int] = 0
+    xact_abort: bool = True
 
     _ALIASES = {
         "user": "UID",
@@ -104,6 +107,7 @@ class SQLServerCredentials(Credentials):
             "encrypt",
             "trust_cert",
             "backend",
+            "xact_abort",
         )
 
         if self.backend == SQLServerBackend.pyodbc:
