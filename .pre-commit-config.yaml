@@ -1,5 +1,11 @@
 default_language_version:
   python: python3.11
+ci:
+  # The ty hook shells out to uv to resolve this project's dependencies, and
+  # pre-commit.ci runs hooks without network access. The Type check workflow
+  # runs ty in GitHub Actions instead.
+  skip:
+    - ty
 repos:
   - repo: 'https://github.com/pre-commit/pre-commit-hooks'
     rev: v6.0.0
@@ -28,7 +34,7 @@ repos:
           - '-d {extends: default, rules: {line-length: disable, document-start: disable}}'
           - '-s'
   - repo: 'https://github.com/astral-sh/ruff-pre-commit'
-    rev: v0.15.20
+    rev: v0.16.5
     hooks:
       - id: ruff-check
         args:
@@ -45,22 +51,17 @@ repos:
         args:
           - '--check'
           - '--diff'
-  - repo: 'https://github.com/pre-commit/mirrors-mypy'
-    rev: v2.1.0
+  # The hook takes no file arguments: an edit in one file can move diagnostics
+  # into another, so ty rechecks its whole configured scope every run.
+  - repo: local
     hooks:
-      - id: mypy
-        args:
-          - '--show-error-codes'
-          - '--ignore-missing-imports'
-          - '--explicit-package-bases'
-        files: '^dbt/adapters'
-      - id: mypy
-        alias: mypy-check
-        stages:
-          - manual
-        args:
-          - '--show-error-codes'
-          - '--pretty'
-          - '--ignore-missing-imports'
-          - '--explicit-package-bases'
-        files: '^dbt/adapters'
+      - id: ty
+        name: ty
+        entry: uv run --frozen ty check
+        language: system
+        types_or:
+          - python
+          - pyi
+        pass_filenames: false
+        always_run: true
+        require_serial: true

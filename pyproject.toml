@@ -62,21 +62,17 @@ dev = [
     "adbc-driver-manager>=1.0.0",
     "pyarrow>=14.0.0",
     "build",
-    "bumpversion",
     "flaky",
     "freezegun>=1.5.0,<2.0",
     "ipdb",
-    "mypy==2.1.0",
     "pre-commit",
     "pytest",
     "pytest-cov",
-    "pytest-csv",
     "pytest-dotenv",
     "pytest-xdist",
-    "pytz",
     "ruff",
-    "tox>=3.13",
     "twine",
+    "ty",
 ]
 
 [project.urls]
@@ -119,4 +115,18 @@ known-first-party = ["dbt"]
 ban-relative-imports = "all"
 
 [tool.ty.environment]
-python = ".venv"
+# Check against the oldest interpreter the adapter is built for, matching
+# ruff's target-version, rather than whichever version .venv happens to hold.
+python-version = "3.11"
+
+[tool.ty.src]
+# The adapter package only; the test suite is not type checked.
+include = ["dbt/adapters"]
+
+[tool.ty.rules]
+# `dbt` is a namespace split across distributions: dbt-core and dbt-adapters
+# own `dbt/` and `dbt/adapters/` in site-packages, this repo contributes
+# `dbt/adapters/sqlserver` from the project root, and the two halves are joined
+# at runtime by the editable install's import hook. No static checker can
+# follow that, so every `dbt.*` import reads as unresolvable here.
+unresolved-import = "ignore"
