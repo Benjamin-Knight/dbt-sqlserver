@@ -1,0 +1,1 @@
+Fix a unit test that errors - rather than fails its comparison - leaving its `__dbt_tmp` fixture table behind, and, with `dbt_sqlserver_use_dbt_transactions` off, its comparison views too. The fixture table only supplies the model's column types, so it is now dropped and committed before the comparison runs rather than after it, and the comparison drops its views when it raises.

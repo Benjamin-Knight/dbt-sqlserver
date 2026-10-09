@@ -231,6 +231,66 @@ def get_mssql_python_retryable_exceptions(
     return tuple(retryable_exceptions)
 
 
+# mssql-python keeps no SQLSTATE on its exceptions, only the class and the
+# fixed ``driver_error`` text its SQLSTATE mapping assigns, so a warning is
+# recognised by rebuilding that pair. A state belongs here only if its pair is
+# unique to it: 01004 shares its pair with 22001, a real truncation error.
+_MSSQL_PYTHON_WARNING_SQLSTATES = ("01003",)
+
+
+def warning_sqlstate(error: Exception) -> str | None:
+    """Return the SQLSTATE of *error* when it is a warning (class 01), else None.
+
+    Warnings do not fail a statement, so a raised warning means the driver
+    received an error with it and reported only the diagnostic that came
+    first. This happens when a warning such as 8153 and the error are raised
+    inside a nested batch - ``EXEC()``, ``sp_executesql`` or a stored
+    procedure - and reliably so under SET NOCOUNT ON; in a plain batch both
+    drivers report the error. The error cannot be recovered afterwards: on
+    pyodbc and mssql-python the pending result is gone and ``nextset()``
+    returns False without raising.
+    """
+
+    module = type(error).__module__ or ""
+    if module == "pyodbc":
+        # pyodbc has no class for SQLSTATE 01, so this arrives as the base
+        # ``pyodbc.Error``, not a ``DatabaseError``, with args (sqlstate, message).
+        args = getattr(error, "args", ())
+        if args and isinstance(args[0], str) and args[0].startswith("01"):
+            return args[0]
+        return None
+    if module.startswith("mssql_python"):
+        try:
+            from mssql_python.exceptions import sqlstate_to_exception
+        except ImportError:
+            return None
+        for sqlstate in _MSSQL_PYTHON_WARNING_SQLSTATES:
+            reference = sqlstate_to_exception(sqlstate, "")
+            if (
+                reference is not None
+                and type(reference) is type(error)
+                and getattr(reference, "driver_error", None)
+                == getattr(error, "driver_error", object())
+            ):
+                return sqlstate
+    return None
+
+
+def describe_masked_error(sqlstate: str, message: str) -> str:
+    """Explain that *message*, a warning, stands in for an error that was lost."""
+
+    return (
+        f"The statement failed, but the driver reported only a warning "
+        f"(SQLSTATE {sqlstate}) and lost the real error. A warning cannot fail "
+        f"a statement: when a warning and an error are raised inside a nested "
+        f"batch (EXEC(), sp_executesql or a stored procedure), the driver can "
+        f"report only the warning. The real error is not written to the SQL "
+        f"Server error log; to see it, run the compiled SQL directly (SSMS shows "
+        f"every message) or capture it with an Extended Events session on "
+        f"error_reported. The warning was: {message}"
+    )
+
+
 def handle_backend_database_error(
     error: Exception,
     database_error: type[Exception] | None,
@@ -239,10 +299,12 @@ def handle_backend_database_error(
     """Translate backend database exceptions into dbt runtime errors.
 
     Call this only after the caller has identified the backend-specific error
-    type; non-database errors should bypass this helper.
+    type, or a warning that stands in for one (see ``warning_sqlstate``);
+    other errors should bypass this helper.
     """
 
-    if database_error is None or not isinstance(error, database_error):
+    sqlstate = warning_sqlstate(error)
+    if sqlstate is None and (database_error is None or not isinstance(error, database_error)):
         return
 
     logger.debug(f"Database error: {error}")
@@ -250,7 +312,11 @@ def handle_backend_database_error(
     with suppress(Exception):
         release_connection()
 
-    raise dbt_common.exceptions.DbtDatabaseError(str(error).strip()) from error
+    message = str(error).strip()
+    if sqlstate is not None:
+        message = describe_masked_error(sqlstate, message)
+
+    raise dbt_common.exceptions.DbtDatabaseError(message) from error
 
 
 def log_connection_string(connection_string: str) -> None:
