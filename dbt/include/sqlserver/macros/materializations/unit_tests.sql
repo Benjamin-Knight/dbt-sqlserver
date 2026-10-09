@@ -1,10 +1,17 @@
+{%- materialization unit, adapter='sqlserver' -%}
+  {#- The default drops its fixture table inside the transaction
+      statement('main') opens and never commits, so with
+      dbt_sqlserver_use_dbt_transactions on the drop rolls back
+      (dbt-labs/dbt#16499). -#}
+  {% set relations = materialization_unit_default() %}
+  {% do adapter.commit_if_open() %}
+  {{ return(relations) }}
+{%- endmaterialization -%}
+
 {% macro sqlserver__get_unit_test_sql(main_sql, expected_fixture_sql, expected_column_names) -%}
 
   {{ get_use_database_sql(target.database) }}
-  IF NOT EXISTS (SELECT * FROM sys.schemas WHERE name = '{{ target.schema }}')
-  BEGIN
-  EXEC('CREATE SCHEMA {{ adapter.quote(target.schema) }}')
-  END
+  {{ create_schema_if_not_exists(target.schema) }}
 
   {% set test_view_name = "testview_" ~ local_md5(main_sql) ~ "_" ~ (range(1300, 19000) | random) %}
   {% set test_view %}

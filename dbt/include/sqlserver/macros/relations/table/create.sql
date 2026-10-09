@@ -35,7 +35,11 @@
         {{ get_assert_columns_equivalent(sql) }}
         {{ build_columns_constraints(relation) }}
     {%- else -%}
+        {#- the UNION ALL keeps SELECT INTO from copying an IDENTITY column, which the
+            load's explicit ids would then violate; nullability and types are unchanged -#}
         SELECT TOP 0 * INTO {{ relation }} FROM {{ tmp_relation }}
+        UNION ALL
+        SELECT TOP 0 * FROM {{ tmp_relation }}
     {%- endif -%}
 {%- endmacro %}
 
@@ -149,7 +153,7 @@
 {%- endmacro %}
 
 
-{% macro sqlserver__get_create_table_load_sql(temporary, relation, sql, drop_tmp_view=True) -%}
+{% macro sqlserver__get_create_table_load_sql(temporary, relation, sql, drop_tmp_view=True, logical_relation=none) -%}
     {#-
       Second half of a table build: load the object the stage half created,
       then clean up and add the clustered columnstore index.
@@ -186,12 +190,7 @@
 
     {% set as_columnstore = config.get('as_columnstore', default=true) %}
     {% if not temporary and as_columnstore -%}
-        {#-
-        add columnstore index
-        this creates with dbt_temp as its coming from a temporary relation before renaming
-        could alter relation to drop the dbt_temp portion if needed
-        -#}
-        {{ sqlserver__create_clustered_columnstore_index(relation) }}
+        {{ sqlserver__create_clustered_columnstore_index(relation, logical_relation) }}
    {% endif %}
 {%- endmacro %}
 

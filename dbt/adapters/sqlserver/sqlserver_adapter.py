@@ -1,6 +1,7 @@
 import datetime as _dt
 import re
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from contextlib import contextmanager
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Type, Union
 
 import agate
 import dbt_common.exceptions
@@ -59,12 +60,7 @@ _KEYED_CONSTRAINTS = frozenset(
 # full just to read its column names.
 _SQL_COMMENT = re.compile(r"(?s)/\*.*?\*/|--[^\n]*\n")
 
-# sp_describe_first_result_set reports what it declines to describe with its
-# own 11500-11599 family, which every backend carries through in the message
-# text. Anything outside it is the query's own error.
-_DESCRIBE_DECLINED = re.compile(r"\(\s*115\d\d\s*\)|metadata could not be determined", re.I)
-
-# sp_describe_first_result_set reports true SQL Server types; reading
+# The describe reports true SQL Server types; reading
 # ``cursor.description`` reports Python classes, which collapse whole families
 # (every integer width arrives as ``int``, every string type as ``varchar``).
 # Contract comparison comes through this method either way, so the describe
@@ -231,6 +227,13 @@ class SQLServerAdapter(SQLAdapter):
         SQLServerConnectionManager._dbt_sqlserver_use_dbt_transactions = use_dbt_transactions
         self.connections._dbt_sqlserver_use_dbt_transactions = use_dbt_transactions
 
+    @SQLAdapter.behavior.setter
+    def behavior(self, flags: List[BehaviorFlag]) -> None:
+        # The base setter extends `flags` in place, and it is passed the module-level
+        # DEFAULT_BASE_BEHAVIOR_FLAGS, which then grows on every adapter init (#855).
+        # Drop once dbt-adapters stops mutating it.
+        SQLAdapter.behavior.fset(self, list(flags))
+
     @property
     def _behavior_flags(self) -> List[BehaviorFlag]:
         # dbt-common declares BehaviorFlag's optional keys with a NotRequired
@@ -336,20 +339,20 @@ class SQLServerAdapter(SQLAdapter):
     def _describe_result_set(self, sql: str) -> Optional[List[BaseColumn]]:
         """Read a query's column shape without running it, or None to fall back.
 
-        ``sp_describe_first_result_set`` compiles the query and reports its
-        result shape, which is all this method ever wanted. It is already how
-        ``sqlserver__get_columns_in_query`` handles CTEs (#698).
+        ``sys.dm_exec_describe_first_result_set`` compiles the query and
+        reports its result shape, which is all this method ever wanted. It is
+        the table-valued form of the ``sp_describe_first_result_set`` that
+        ``sqlserver__get_columns_in_query`` uses for CTEs (#698).
 
         Returns None -- deliberately, rather than raising -- whenever the
         describe cannot be trusted to match what executing would have reported:
-        an unsupported backend, a query it refuses to describe (it cannot see
-        through ``#temp`` tables, where executing works), or a type this
+        an unsupported backend, a query the describe fails on, or a type this
         backend's driver has no known executed name for. The caller then
         executes as before, which is slower but never disagrees with itself.
 
-        A query that fails to compile is raised rather than absorbed: no
-        fallback can produce metadata for it, and its error names what is
-        wrong.
+        A query that fails to compile is no exception: executing it fails at
+        compile too, costing nothing, and raises the query's own error --
+        Msg 207 naming the missing column -- through the normal path.
         """
         credentials = self.connections.profile.credentials
         if is_adbc_backend(credentials.backend):
@@ -359,26 +362,25 @@ class SQLServerAdapter(SQLAdapter):
             # disagree on that backend.
             return None
 
+        # The function rather than ``exec sp_describe_first_result_set``: the
+        # procedure raises whatever stops it describing, and handling a raised
+        # error closes the connection, so the fallback executed on a closed
+        # handle and reported that instead. The function hands the same
+        # failures back as rows with an error_number, which leaves the
+        # connection alone and needs no parsing of driver message text (which
+        # mssql-python strips of the error number anyway).
+        #
         # Inline rather than bound: mssql-python binds str as varchar and the
-        # procedure demands nvarchar(max). columns.sql:24 escapes it the same
+        # function demands nvarchar(max). columns.sql:24 escapes it the same
         # way for the same reason.
-        describe_sql = "exec sp_describe_first_result_set @tsql = N'{}'".format(
-            sql.replace("'", "''")
-        )
+        describe_sql = (
+            "select is_hidden, name, system_type_name, error_number, error_message"
+            " from sys.dm_exec_describe_first_result_set(N'{}', null, 0)"
+            " order by column_ordinal"
+        ).format(sql.replace("'", "''"))
 
+        _, cursor = self.connections.add_select_query(describe_sql)
         try:
-            _, cursor = self.connections.add_select_query(describe_sql)
-        except Exception as e:
-            if not _DESCRIBE_DECLINED.search(str(e)):
-                # Handling this error has already closed the connection, so the
-                # fallback would fail on that instead and report "Attempt to
-                # use a closed connection" in place of the bad column name.
-                raise
-            logger.debug(f"Could not describe a CTE query, falling back to executing it: {e}")
-            return None
-
-        try:
-            fields = [description[0].lower() for description in cursor.description]
             rows = cursor.fetchall()
         except Exception as e:
             logger.debug(f"Could not read a described result set, executing the query: {e}")
@@ -386,32 +388,35 @@ class SQLServerAdapter(SQLAdapter):
         finally:
             _discard_pending_results(cursor)
 
-        try:
-            hidden, name, type_name = (
-                fields.index("is_hidden"),
-                fields.index("name"),
-                fields.index("system_type_name"),
+        errors = [
+            f"Msg {error_number}: {message}" for *_, error_number, message in rows if error_number
+        ]
+        if errors:
+            # Nothing to tell apart here. A query the describe declines -- one
+            # under SET STATISTICS XML, say -- executes fine; one that does
+            # not compile fails executing too, with its own message.
+            logger.debug(
+                f"Could not describe a CTE query, executing it instead: {'; '.join(errors)}"
             )
-        except ValueError:  # pragma: no cover - shape is fixed by SQL Server
             return None
 
         columns = []
-        for row in rows:
-            if row[hidden]:
+        for hidden, name, type_name, *_ in rows:
+            if hidden:
                 continue
             # "varchar(10)" / "decimal(10,2)" -> "varchar" / "decimal"
-            base_type = str(row[type_name]).split("(")[0].strip().lower()
+            base_type = str(type_name).split("(")[0].strip().lower()
             executed_name = _executed_name_for_system_type(base_type, credentials.backend)
-            if executed_name is None or row[name] is None:
+            if executed_name is None or name is None:
                 logger.debug(
                     f"Describing a CTE query reported {base_type!r}, which has no "
                     "equivalent in the executed path; executing it instead"
                 )
                 return None
-            columns.append(self.Column.create(row[name], executed_name))
+            columns.append(self.Column.create(name, executed_name))
 
         # Every select has at least one column, so nothing described means
-        # sp_describe_first_result_set could not work the shape out. Returning
+        # the describe could not work the shape out. Returning
         # an empty list would read as "this query has no columns" and surface
         # as a baffling contract mismatch; execute instead.
         return columns or None
@@ -442,8 +447,15 @@ class SQLServerAdapter(SQLAdapter):
 
     @classmethod
     def convert_number_type(cls, agate_table, col_idx):
-        decimals = agate_table.aggregate(agate.MaxPrecision(col_idx))
-        return "float" if decimals else "int"
+        if agate_table.aggregate(agate.MaxPrecision(col_idx)):
+            return "float"
+        values = agate_table.columns[col_idx].values_without_nulls()
+        low, high = (min(values), max(values)) if values else (0, 0)
+        if -(2**31) <= low and high < 2**31:
+            return "int"
+        if -(2**63) <= low and high < 2**63:
+            return "bigint"
+        return "numeric(38,0)"
 
     def create_schema(self, relation: BaseRelation) -> None:
         relation = relation.without_identifier()
@@ -466,6 +478,8 @@ class SQLServerAdapter(SQLAdapter):
         # see https://github.com/fishtown-analytics/dbt/pull/2255
         lens = [len(d.encode("utf-8")) for d in column.values_without_nulls()]
         max_len = max(lens) if lens else 64
+        if max_len > 8000:
+            return "varchar(max)"
         length = max_len if max_len > 16 else 16
         return "varchar({})".format(length)
 
@@ -824,13 +838,27 @@ class SQLServerAdapter(SQLAdapter):
 
         return True
 
-    def expand_column_types(self, goal, current, max_rows: int = 1000000):
+    def expand_column_types(
+        self,
+        goal,
+        current,
+        max_rows: int = 1000000,
+        prefer_single_alter_column: Optional[bool] = None,
+    ):
         """Widen ``current``'s columns to match ``goal``, preserving the
         nvarchar / nchar family.
 
         Same-family resizes (a longer varchar) always proceed. Cross-family
         promotions (varchar -> nvarchar) are opt-in and gated; see
         ``_safe_expansion_allowed``.
+
+        ``prefer_single_alter_column`` is the model's config. Unset, a
+        same-family resize uses a single ``ALTER COLUMN``: metadata-only for a
+        longer varchar, atomic, and it keeps indexes, defaults and column
+        position, all of which block or move the four-step rewrite. A
+        cross-family promotion keeps the four-step path, since a single
+        ``ALTER COLUMN`` to nvarchar on a large columnstore table can fail
+        with Msg 35357 (dictionary size limit).
         """
 
         reference_columns = {c.name: c for c in self.get_columns_in_relation(goal)}
@@ -843,8 +871,9 @@ class SQLServerAdapter(SQLAdapter):
             if target_column is None:
                 continue
 
+            same_family = target_column.can_expand_to(reference_column)
             if not (
-                target_column.can_expand_to(reference_column)
+                same_family
                 or (safe_expansion_allowed and target_column.can_expand_safe(reference_column))
             ):
                 continue
@@ -861,11 +890,46 @@ class SQLServerAdapter(SQLAdapter):
                     table=_make_ref_key_dict(current),
                 )
             )
-            self.alter_column_type(current, column_name, new_type)
+            prefer_single = (
+                same_family if prefer_single_alter_column is None else prefer_single_alter_column
+            )
+            self.alter_column_type(current, column_name, new_type, prefer_single)
+
+    def alter_column_type(
+        self,
+        relation,
+        column_name,
+        new_column_type,
+        prefer_single_alter_column: Optional[bool] = None,
+    ) -> None:
+        """Pass the model's ``prefer_single_alter_column`` to the macro.
+
+        A macro run from Python sees no model config, so
+        ``config.get('prefer_single_alter_column')`` inside it is always the
+        default; and dbt-adapters' ``alter_column_type`` dispatcher forwards
+        only the three standard arguments. When the setting is known, call
+        the SQL Server implementation with it directly (dbt-msft/dbt-sqlserver#836).
+        """
+        if prefer_single_alter_column is None:
+            super().alter_column_type(relation, column_name, new_column_type)
+            return
+        self.execute_macro(
+            "sqlserver__alter_column_type",
+            kwargs={
+                "relation": relation,
+                "column_name": column_name,
+                "new_column_type": new_column_type,
+                "prefer_single": prefer_single_alter_column,
+            },
+        )
 
     @available.parse_none
     def expand_target_column_types(
-        self, from_relation: BaseRelation, to_relation: BaseRelation, max_rows: int = 1000000
+        self,
+        from_relation: BaseRelation,
+        to_relation: BaseRelation,
+        max_rows: int = 1000000,
+        prefer_single_alter_column: Optional[bool] = None,
     ) -> None:
         if not isinstance(from_relation, self.Relation):
             from dbt.adapters.base.impl import MacroArgTypeError
@@ -885,7 +949,7 @@ class SQLServerAdapter(SQLAdapter):
                 got_value=to_relation,
                 expected_type=self.Relation,
             )
-        self.expand_column_types(from_relation, to_relation, max_rows)
+        self.expand_column_types(from_relation, to_relation, max_rows, prefer_single_alter_column)
 
     @available
     def parse_index(self, raw_index: Any) -> Optional[SQLServerIndexConfig]:
@@ -901,6 +965,28 @@ class SQLServerAdapter(SQLAdapter):
         if not parsed:
             return False
         return create_needs_own_batch(parsed.build_options)
+
+    # dbt-core's run-operation runs on connections with these names.
+    _RUN_OPERATION_CONNECTION_PREFIXES = ("macro_", "inline_query")
+
+    @contextmanager
+    def connection_named(
+        self, name: str, query_header_context: Any = None, should_release_connection: bool = True
+    ) -> Iterator[None]:
+        """Commit a run-operation's open transaction when it finishes cleanly.
+
+        Stopgap for dbt-labs/dbt#16434, remove once dbt-core commits after a
+        run-operation: dbt-core never does, so with dbt-managed transactions
+        on, a write through ``statement()`` (auto_begin) is rolled back when
+        the connection closes. The commit sits after the ``yield`` so it runs
+        only when the macro did not raise; a failed macro still rolls back.
+        Matching on the connection name is a heuristic, since dbt-core marks
+        run-operation connections no other way.
+        """
+        with super().connection_named(name, query_header_context, should_release_connection):
+            yield
+            if name.startswith(self._RUN_OPERATION_CONNECTION_PREFIXES):
+                self.commit_if_open()
 
     @available
     def commit_if_open(self) -> None:
