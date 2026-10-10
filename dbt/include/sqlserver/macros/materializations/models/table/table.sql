@@ -111,19 +111,13 @@
         'main') rather than being wrapped in one here, so it can commit its
         in-progress marker independently of the load that follows - see the
         macro for why. -#}
-    {% do sqlserver__create_table_as_prebuilt(target_relation, sql) %}
+    {% do sqlserver__create_table_as_prebuilt(target_relation, sql, mask_config) %}
 
     {#- the prebuilt path lands the table via raw SQL, not a cache-maintaining
         adapter method (rename_relation), and above it may have dropped the
         existing relation from the cache; register the rebuilt target so dbt's
         relation cache stays in sync with the database -#}
     {% do adapter.cache_added(target_relation) %}
-
-    {#- Masks before create_indexes (a mask cannot be added to an index key
-         column). prebuilt already built its clustered design: a CCI exposes
-         no key columns, but a mask on a clustered rowstore key column fails
-         here with a descriptive error (recovery: heap_then_index). -#}
-    {% do apply_masks(target_relation, mask_config) %}
   {% else %}
     -- build model
     {% if stage_before_hooks %}

@@ -8,12 +8,8 @@ every --full-refresh. It also has an ordering constraint unique to prebuilt:
     sqlserver__create_table_as_prebuilt, before masks can be applied;
   * the nonclustered indexes are built *after*, by create_indexes.
 
-apply_masks must therefore run after the load but before create_indexes, so a
-mask on a nonclustered-index key column lands before that index exists
-(mask-then-index; SQL Server rejects adding a mask to an already-indexed key
-column). A CCI exposes no key columns, so masks apply freely after it. A mask
-on the clustered *rowstore* key column cannot be honoured on this path (the
-clustered index already exists by the time we can mask) and must fail clearly.
+SQL Server rejects adding a mask to an already-indexed key column, so prebuilt
+masks the empty table before building either.
 
 Requires SQL Server 2016+ (DDM). The CI/test server is 2022.
 """
@@ -116,33 +112,52 @@ class TestPrebuiltRowstoreMaskOnNonclusteredKey:
 
 
 # ---------------------------------------------------------------------------
-# Rowstore prebuilt with a mask on the CLUSTERED rowstore key column. The
-# clustered index is built inside create_table_as_prebuilt before we can mask,
-# so this can't be honoured — apply_masks must fail with the index-key error
-# rather than silently dropping the mask.
+# Rowstore prebuilt with masks on both the CLUSTERED key and a nonclustered
+# key. prebuilt builds the clustered index itself, so it must mask the empty
+# table before that index exists. Covers the table and incremental paths.
 # ---------------------------------------------------------------------------
 
-rowstore_prebuilt_masked_clustered_key_sql = """
-{{ config(
-    materialized="table",
+clustered_key_masked_config = """
     as_columnstore=False,
     full_refresh_build="prebuilt",
     indexes=[
-      {'columns': ['column_a'], 'type': 'clustered'},
+      {'columns': ['column_a', 'column_b'], 'type': 'clustered'},
+      {'columns': ['column_c'], 'type': 'nonclustered', 'included_columns': ['column_a']},
     ],
-    masks={"column_a": "default()"}
-) }}
-select cast('secret' as varchar(50)) as column_a, 2 as column_b
+    masks={"column_b": "default()", "column_c": "default()"}
 """
 
+clustered_key_select = """
+select 1 as column_a, cast('secret' as varchar(50)) as column_b,
+       cast('pseudo' as varchar(50)) as column_c
+"""
 
-class TestPrebuiltRowstoreMaskOnClusteredKeyErrors:
+table_clustered_key_masked_sql = (
+    '{{ config(materialized="table",' + clustered_key_masked_config + ") }}" + clustered_key_select
+)
+
+incremental_clustered_key_masked_sql = (
+    '{{ config(materialized="incremental", unique_key="column_a",'
+    ' incremental_strategy="delete+insert",'
+    + clustered_key_masked_config
+    + ") }}"
+    + clustered_key_select
+)
+
+
+class TestPrebuiltRowstoreMaskOnClusteredKey:
     @pytest.fixture(scope="class")
     def models(self):
-        return {"rowstore_prebuilt_clustered.sql": rowstore_prebuilt_masked_clustered_key_sql}
+        return {
+            "table_clustered_key.sql": table_clustered_key_masked_sql,
+            "incremental_clustered_key.sql": incremental_clustered_key_masked_sql,
+        }
 
-    def test_mask_on_clustered_key_raises(self, project):
-        results = run_dbt(["run", "--full-refresh"], expect_pass=False)
-        assert len(results) == 1
-        assert results[0].status == "error"
-        assert "index" in str(results[0].message).lower()
+    def test_masks_on_index_keys_survive_fresh_and_full_refresh_builds(self, project):
+        expected = {"column_b": "default()", "column_c": "default()"}
+        # fresh build, then a prebuilt rebuild over the existing masked table
+        for args in (["run"], ["run", "--full-refresh"]):
+            run_dbt(args)
+            for table in ("table_clustered_key", "incremental_clustered_key"):
+                assert masked_columns(project, table) == expected
+                assert index_types(project, table) == {"CLUSTERED", "NONCLUSTERED"}
