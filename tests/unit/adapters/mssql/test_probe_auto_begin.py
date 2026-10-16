@@ -32,6 +32,10 @@ KNOWN_EXCEPTIONS = {
     "get_relation_without_caching": "cache population, not a materialization tail",
     "last_modified": "source freshness, not a materialization tail",
     "catalog": "dbt docs generate, not a materialization tail",
+    "dml_refresh_swap": (
+        "the delta swap writes and must open the cutover transaction; "
+        "it fetches only the path it took"
+    ),
 }
 
 # Guards against the regex silently matching nothing if the macro style changes.
