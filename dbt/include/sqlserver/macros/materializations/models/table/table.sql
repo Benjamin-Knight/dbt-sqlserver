@@ -209,14 +209,17 @@
       putting back part of the window this tail exists to remove. -#}
   {% do adapter.commit_if_open() %}
 
-  {#- dml scratch tables, dropped after the commit so their catalog locks
-      end with the statement. -#}
-  {% if use_dml_refresh %}
+  {#- dml scratch table, dropped after the commit so its catalog locks end
+      with the statement. -#}
+  {% if use_dml_refresh and dml_result['refresh_relation'] is not none %}
     {% call statement('dml_refresh_cleanup_post', auto_begin=False) -%}
-      {{ get_use_database_sql(dml_stage['gone_relation'].database) }}
-      {% if dml_result['refresh_relation'] is not none %}
+      {{ get_use_database_sql(dml_result['refresh_relation'].database) }}
       DROP TABLE IF EXISTS {{ dml_result['refresh_relation'] }};
-      {% endif %}
+    {%- endcall %}
+  {% endif %}
+  {% if use_dml_refresh and table_refresh_method == 'delta' %}
+    {% call statement('delta_refresh_cleanup_post', auto_begin=False) -%}
+      {{ get_use_database_sql(dml_stage['gone_relation'].database) }}
       DROP TABLE IF EXISTS {{ dml_stage['gone_relation'] }};
     {%- endcall %}
   {% endif %}
