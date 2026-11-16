@@ -32,6 +32,70 @@
 {% endmacro %}
 
 
+{#- The delta_key config as the target's quoted column names, or [] when unset.
+    A name the target lacks raises here, before any scratch load. -#}
+{% macro sqlserver__delta_key_columns(columns, relation) %}
+  {%- set configured = config.get('delta_key') -%}
+  {%- if not configured -%}
+    {{- return([]) -}}
+  {%- endif -%}
+  {%- if configured is string -%}
+    {%- set configured = [configured] -%}
+  {%- endif -%}
+  {%- set by_name = {} -%}
+  {%- for col in columns -%}
+    {%- do by_name.update({col.name | lower: col.quoted}) -%}
+  {%- endfor -%}
+  {%- set resolved = [] -%}
+  {%- for name in configured -%}
+    {%- if name | lower not in by_name -%}
+      {{ exceptions.raise_compiler_error(
+        "delta_key column '" ~ name ~ "' is not a column of " ~ relation
+        ~ ". Columns: " ~ columns | map(attribute='name') | join(', ')
+      ) }}
+    {%- endif -%}
+    {%- do resolved.append(by_name[name | lower]) -%}
+  {%- endfor -%}
+  {{- return(resolved) -}}
+{% endmacro %}
+
+
+{#- Sets @dbt_dupes > 0 when two scratch rows are equal on every delta key,
+    which set operations would collapse.
+
+    With delta_key, a key unique in scratch proves no two rows are equal on
+    every column, so the full-width aggregate is skipped. A non-unique key
+    proves nothing (the other columns may differ), so it falls through to the
+    exact check.
+
+    The exact check hash-aggregates every column, which sizes its memory grant
+    by row width, so it runs only over rows whose CHECKSUM collides with
+    another's. Rows equal under the GROUP BY (collation, DATALENGTH) always
+    share a CHECKSUM, so no duplicate escapes the narrowing; the converse does
+    not hold, hence the exact pass. -#}
+{% macro sqlserver__delta_dupes_sql(columns, relation, key_columns, query_label) %}
+  {%- set keys = sqlserver__delta_keys(columns, 's', named=false) -%}
+  {%- set keys_c = sqlserver__delta_keys(columns, 'c', named=false) -%}
+  DECLARE @dbt_dupes bigint = 1;
+  {% if key_columns %}
+  SELECT @dbt_dupes = COUNT_BIG(*) FROM (
+    SELECT 1 AS x FROM {{ relation }} s
+    GROUP BY {{ key_columns | join(', ') }} HAVING COUNT_BIG(*) > 1) d
+  {{ query_label }}
+  {% endif %}
+  IF @dbt_dupes > 0
+  BEGIN
+    SELECT @dbt_dupes = COUNT_BIG(*) FROM (
+      SELECT 1 AS x FROM {{ relation }} s
+      WHERE CHECKSUM({{ keys }}) IN (
+        SELECT CHECKSUM({{ keys_c }}) FROM {{ relation }} c
+        GROUP BY CHECKSUM({{ keys_c }}) HAVING COUNT_BIG(*) > 1)
+      GROUP BY {{ keys }} HAVING COUNT_BIG(*) > 1) d
+    {{ query_label }}
+  END;
+{% endmacro %}
+
+
 {#- Types EXCEPT, INTERSECT and CHECKSUM cannot compare, and sql_variant,
     whose = ignores trailing spaces and base-type changes. -#}
 {% macro sqlserver__delta_unsupported_columns(columns) %}
@@ -109,9 +173,11 @@
       transaction). Shaped from the target's keys; unused if the schema
       changed. -#}
   {%- set use_delta = false -%}
+  {%- set delta_key = [] -%}
   {% if refresh_method == 'delta' %}
     {%- set target_columns = adapter.get_columns_in_relation(target_relation) -%}
     {%- set unsupported = sqlserver__delta_unsupported_columns(target_columns) -%}
+    {%- set delta_key = sqlserver__delta_key_columns(target_columns, target_relation) -%}
     {%- set conflicts = [] if unsupported else sqlserver__delta_collation_conflicts(target_relation, refresh_relation) -%}
     {% if unsupported or conflicts %}
       {% do exceptions.warn(
@@ -133,7 +199,8 @@
     'refresh_relation': refresh_relation,
     'tmp_vw_relation': tmp_vw_relation,
     'gone_relation': gone_relation,
-    'use_delta': use_delta
+    'use_delta': use_delta,
+    'delta_key': delta_key
   }) }}
 {% endmacro %}
 
@@ -212,7 +279,8 @@
           only the rows the target lacks. Falls back to the full swap, in the
           same transaction, when:
             duplicates  scratch has rows equal on every key: set operations
-                        would collapse them
+                        would collapse them (exact check, see
+                        sqlserver__delta_dupes_sql)
             churn       more than 15% of rows differ: past that the full swap
                         is cheaper; TOP stops the EXCEPT once it is clear
             count       target row count differs after the delta: it held
@@ -230,9 +298,8 @@
         DECLARE @dbt_rows bigint = (SELECT COUNT_BIG(*) FROM {{ refresh_relation }});
         DECLARE @dbt_path varchar(16) = 'delta';
 
-        IF (SELECT COUNT_BIG(*) FROM (
-              SELECT 1 AS x FROM {{ refresh_relation }} s
-              GROUP BY {{ sqlserver__delta_keys(target_columns, 's', named=false) }}) d) <> @dbt_rows
+        {{ sqlserver__delta_dupes_sql(target_columns, refresh_relation, stage['delta_key'], query_label) }}
+        IF @dbt_dupes > 0
           SET @dbt_path = 'duplicates';
 
         IF @dbt_path = 'delta'
@@ -241,7 +308,8 @@
           SELECT {{ sqlserver__delta_key_names(target_columns, 'd') }}, CHECKSUM({{ sqlserver__delta_key_names(target_columns, 'd') }})
           FROM (SELECT {{ sqlserver__delta_keys(target_columns, 'l') }} FROM {{ target_relation }} l WITH (TABLOCKX)
                 EXCEPT
-                SELECT {{ sqlserver__delta_keys(target_columns, 's') }} FROM {{ refresh_relation }} s) d;
+                SELECT {{ sqlserver__delta_keys(target_columns, 's') }} FROM {{ refresh_relation }} s) d
+          {{ query_label }}
           IF @@ROWCOUNT > {{ churn_cap }}
             SET @dbt_path = 'churn';
         END;
@@ -254,7 +322,8 @@
             WHERE g.[__dbt_ck] = CHECKSUM({{ sqlserver__delta_keys(target_columns, 'l', named=false) }})
               AND EXISTS (SELECT {{ sqlserver__delta_key_names(target_columns, 'g') }}
                           INTERSECT
-                          SELECT {{ sqlserver__delta_keys(target_columns, 'l', named=false) }}));
+                          SELECT {{ sqlserver__delta_keys(target_columns, 'l', named=false) }}))
+          {{ query_label }}
 
           INSERT INTO {{ target_relation }} ({{ column_list }})
           SELECT {{ column_list }} FROM (

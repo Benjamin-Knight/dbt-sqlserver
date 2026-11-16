@@ -37,9 +37,9 @@ def differences(project):
     )[0][0]
 
 
-def refresh(project, expect_pass=True):
+def refresh(project, expect_pass=True, model="delta_model"):
     """Run the model; return the reason it fell back to the full swap, or None."""
-    _, log = run_dbt_and_capture(["run", "--select", "delta_model"], expect_pass=expect_pass)
+    _, log = run_dbt_and_capture(["run", "--select", model], expect_pass=expect_pass)
     marker = "fell back to the full swap: "
     return next(
         (line.split(marker)[1].strip() for line in log.splitlines() if marker in line), None
@@ -183,3 +183,154 @@ class TestDeltaRefreshWithoutDbtTransactions(TestDeltaRefresh):
     @pytest.fixture(scope="class")
     def project_config_update(self):
         return {"flags": {"dbt_sqlserver_use_dbt_transactions": False}}
+
+
+delta_key_model_sql = """
+{{ config(materialized="table", table_refresh_method="delta", delta_key="id", as_columnstore=False,
+          query_options={"max_grant_percent": 50}) }}
+select id, grp, val from {{ target.schema }}.key_src
+"""
+
+delta_composite_key_model_sql = """
+{{ config(materialized="table", table_refresh_method="delta", delta_key=["ID", "grp"],
+          as_columnstore=False) }}
+select id, grp, val from {{ target.schema }}.key_src
+"""
+
+delta_bad_key_model_sql = """
+{{ config(materialized="table", table_refresh_method="delta", delta_key=["id", "nope"],
+          as_columnstore=False) }}
+select id, grp, val from {{ target.schema }}.key_src
+"""
+
+
+class TestDeltaKey:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "key_model.sql": delta_key_model_sql,
+            "key_composite_model.sql": delta_composite_key_model_sql,
+            "key_bad_model.sql": delta_bad_key_model_sql,
+        }
+
+    def test_key_narrows_the_check_without_trusting_it(self, project):
+        s = project.test_schema
+        execute(
+            project,
+            f"""
+            CREATE TABLE {s}.key_src (id int NOT NULL, grp int NOT NULL, val varchar(20) NULL);
+            WITH n AS (SELECT TOP (100) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
+                       FROM sys.all_objects)
+            INSERT {s}.key_src SELECT n, n % 5, CONCAT('v', n) FROM n;
+            """,
+        )
+        for model in ("key_model", "key_composite_model"):
+            run_dbt(["run", "--select", model])
+            assert refresh(project, model=model) is None
+
+        # Unique key, changed row.
+        execute(project, f"UPDATE {s}.key_src SET val = 'z' WHERE id = 2")
+        assert refresh(project, model="key_model") is None
+
+        # Key repeats but the rows differ: the key proves nothing, the exact check passes.
+        execute(project, f"INSERT {s}.key_src VALUES (1, 1, 'other')")
+        assert refresh(project, model="key_model") is None
+        assert refresh(project, model="key_composite_model") is None
+
+        # Key repeats and so does the whole row: only the exact check can see it.
+        execute(project, f"INSERT {s}.key_src VALUES (1, 1, 'other')")
+        assert refresh(project, model="key_model") == "duplicates"
+        assert refresh(project, model="key_composite_model") == "duplicates"
+        assert (
+            execute(project, f"SELECT COUNT(*) FROM {s}.key_model", fetch=True)[0][0]
+            == execute(project, f"SELECT COUNT(*) FROM {s}.key_src", fetch=True)[0][0]
+        )
+
+    def test_unknown_key_column_is_named(self, project):
+        run_dbt(["run", "--select", "key_bad_model"])
+        results = run_dbt(["run", "--select", "key_bad_model"], expect_pass=False)
+        assert "delta_key column 'nope'" in results[0].message
+
+
+delta_ci_model_sql = """
+{{ config(materialized="table", table_refresh_method="delta", as_columnstore=False) }}
+select id, s, n, b, f from {{ target.schema }}.ci_src
+"""
+
+
+class TestDeltaDuplicateCheckEquality:
+    """No delta_key: the checksum-narrowed check must flag exactly what the full GROUP BY does."""
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {"ci_model.sql": delta_ci_model_sql}
+
+    def test_checksum_agrees_with_group_by(self, project):
+        s = project.test_schema
+        # Rows the GROUP BY keys treat as equal must share a CHECKSUM, or stage 1 misses them.
+        values = (
+            "('abc'),('ABC'),('Abc'),('àbc'),('ÀBÇ'),('abç'),('abc '),('ABC '),('abç  '),"
+            "('aa'),('Aa'),('áa'),('ae'),('æ'),('ß'),('ss'),('SS'),('o'),('ö'),('Ö'),(''),(' '),"
+            "(NULL)"
+        )
+        violations = sum(
+            execute(
+                project,
+                f"""
+                SELECT COUNT(*) FROM (
+                  SELECT 1 AS x FROM (SELECT CAST(s AS varchar(10)) COLLATE {coll} AS s
+                                      FROM (VALUES {values}) v(s)) t
+                  GROUP BY s, DATALENGTH(s)
+                  HAVING COUNT(DISTINCT CHECKSUM(s, DATALENGTH(s))) > 1) q
+                """,
+                fetch=True,
+            )[0][0]
+            for coll in (
+                "Latin1_General_CI_AI",
+                "Latin1_General_CI_AS",
+                "Latin1_General_CS_AS",
+                "Latin1_General_BIN2",
+            )
+        )
+        assert violations == 0
+
+        execute(
+            project,
+            f"""
+            CREATE TABLE {s}.ci_src (
+              id int NOT NULL,
+              s varchar(20) COLLATE Latin1_General_CI_AI NULL,
+              n nvarchar(20) COLLATE Latin1_General_CI_AI NULL,
+              b varbinary(8) NULL, f float NULL);
+            INSERT {s}.ci_src VALUES
+              (1, 'abc', N'abc', 0x01, 0), (2, 'abc ', N'abc ', 0x0100, 1),
+              (3, NULL, NULL, NULL, NULL), (4, 'x', N'x', 0x02, 2);
+            """,
+        )
+        run_dbt(["run", "--select", "ci_model"])
+        assert refresh(project, model="ci_model") is None
+
+        # Trailing spaces, varbinary zero padding and NULL-vs-value are distinct rows.
+        execute(
+            project,
+            f"""
+            INSERT {s}.ci_src VALUES
+              (1, 'abc  ', N'abc', 0x01, 0), (1, 'abc', N'abc', 0x010000, 0),
+              (1, NULL, N'abc', 0x01, 0);
+            """,
+        )
+        assert refresh(project, model="ci_model") is None
+
+        # Equal under CI_AI: case-only, accent-only, both.
+        execute(project, f"INSERT {s}.ci_src VALUES (50, 'abc', N'abc', 0x01, 0)")
+        assert refresh(project, model="ci_model") is None
+        for dup in ("'ABC', N'abc'", "'ábc', N'abc'", "'abc', N'ÀBC'"):
+            execute(project, f"INSERT {s}.ci_src VALUES (50, {dup}, 0x01, 0)")
+            assert refresh(project, model="ci_model") == "duplicates", dup
+            execute(project, f"DELETE TOP (1) FROM {s}.ci_src WHERE id = 50")
+            assert refresh(project, model="ci_model") == "count", dup
+            assert refresh(project, model="ci_model") is None, dup
+
+        # NULLs compare equal to each other, and 0 equals -0.
+        execute(project, f"INSERT {s}.ci_src VALUES (3, NULL, NULL, NULL, NULL)")
+        assert refresh(project, model="ci_model") == "duplicates"
