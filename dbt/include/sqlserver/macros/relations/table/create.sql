@@ -283,10 +283,12 @@
         {{ setup_sql }}
     {%- endcall %}
 
-    {#- Mask the empty table before its clustered design is built (SQL Server
-        refuses a mask on an index key column) and before the load, so no row
-        lands unmasked. In the setup transaction: a refused mask rolls back
-        with the create rather than committing a table it cannot mask. -#}
+    {#- Mask the empty table before its clustered design is built (a mask
+        cannot be added to an index key column: SQL Server before 2022
+        rejects it, the adapter's check refuses it on every version) and
+        before the load, so no row lands unmasked. In the setup transaction:
+        a refused mask rolls back with the create rather than committing a
+        table it cannot mask. -#}
     {% do apply_masks(relation, mask_config) %}
 
     {#- Commit the marker on its own ('main' above always opened a transaction,

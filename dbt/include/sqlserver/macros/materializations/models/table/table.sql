@@ -71,8 +71,9 @@
   -- `BEGIN` happens here:
   {{ run_hooks(pre_hooks, inside_transaction=True) }}
 
-  {#- Resolved once: the rename and prebuilt paths apply masks inside the
-      cutover transaction, the dml path reconciles them outside it. -#}
+  {#- Resolved once: the rename path applies masks inside the cutover
+      transaction, prebuilt inside its setup transaction, and the dml path
+      reconciles them outside any. -#}
   {% set mask_config = adapter.resolve_masks(model, config.get('masks')) %}
   {#- 'create' = fresh table, mask-then-create-index. 'reconcile' = the table
       persisted, so indexes converge on config first and masks follow (an index

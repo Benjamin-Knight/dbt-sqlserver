@@ -2,14 +2,12 @@
 
 The prebuilt rebuild path drops and recreates the table, so — like every other
 build path — it must re-apply configured masks or they are silently lost on
-every --full-refresh. It also has an ordering constraint unique to prebuilt:
+every --full-refresh.
 
-  * the clustered design (CCI or clustered rowstore index) is built *inside*
-    sqlserver__create_table_as_prebuilt, before masks can be applied;
-  * the nonclustered indexes are built *after*, by create_indexes.
-
-SQL Server rejects adding a mask to an already-indexed key column, so prebuilt
-masks the empty table before building either.
+A mask cannot be added to an index key column: SQL Server before 2022 rejects
+it, and the adapter's check refuses it on every version. prebuilt therefore
+masks the empty table before it builds the clustered design, and create_indexes
+adds the nonclustered indexes afterwards.
 
 Requires SQL Server 2016+ (DDM). The CI/test server is 2022.
 """
@@ -31,6 +29,13 @@ def masked_columns(project, table_name):
     return {row[0]: row[1] for row in table.rows}
 
 
+def table_exists(project, table_name):
+    sql = f"select OBJECT_ID('{project.test_schema}.{table_name}', 'U')"
+    with get_connection(project.adapter):
+        _, table = project.adapter.execute(sql, fetch=True)
+    return table.rows[0][0] is not None
+
+
 def index_types(project, table_name):
     """Return the set of index type_desc values on the table (index_id > 0)."""
     sql = f"""
@@ -45,7 +50,7 @@ def index_types(project, table_name):
 
 
 # ---------------------------------------------------------------------------
-# CCI prebuilt + mask on a data column — maskable after the CCI exists.
+# CCI prebuilt + mask on a data column.
 # ---------------------------------------------------------------------------
 
 cci_prebuilt_masked_sql = """
@@ -115,6 +120,7 @@ class TestPrebuiltRowstoreMaskOnNonclusteredKey:
 # Rowstore prebuilt with masks on both the CLUSTERED key and a nonclustered
 # key. prebuilt builds the clustered index itself, so it must mask the empty
 # table before that index exists. Covers the table and incremental paths.
+# The refuse_mask var swaps in a mask SQL Server rejects (email() on an int).
 # ---------------------------------------------------------------------------
 
 clustered_key_masked_config = """
@@ -124,7 +130,8 @@ clustered_key_masked_config = """
       {'columns': ['column_a', 'column_b'], 'type': 'clustered'},
       {'columns': ['column_c'], 'type': 'nonclustered', 'included_columns': ['column_a']},
     ],
-    masks={"column_b": "default()", "column_c": "default()"}
+    masks={"column_a": "email()"} if var("refuse_mask", false)
+          else {"column_b": "default()", "column_c": "default()"}
 """
 
 clustered_key_select = """
@@ -153,11 +160,23 @@ class TestPrebuiltRowstoreMaskOnClusteredKey:
             "incremental_clustered_key.sql": incremental_clustered_key_masked_sql,
         }
 
-    def test_masks_on_index_keys_survive_fresh_and_full_refresh_builds(self, project):
+    def test_masks_on_index_keys_survive_rebuilds_and_a_refused_mask_leaves_no_table(
+        self, project
+    ):
+        tables = ("table_clustered_key", "incremental_clustered_key")
         expected = {"column_b": "default()", "column_c": "default()"}
         # fresh build, then a prebuilt rebuild over the existing masked table
         for args in (["run"], ["run", "--full-refresh"]):
             run_dbt(args)
-            for table in ("table_clustered_key", "incremental_clustered_key"):
+            for table in tables:
                 assert masked_columns(project, table) == expected
                 assert index_types(project, table) == {"CLUSTERED", "NONCLUSTERED"}
+
+        # A refused mask rolls back the create: no target, rather than a loaded,
+        # unmasked one. The old table was already dropped and is not restored.
+        results = run_dbt(
+            ["run", "--full-refresh", "--vars", "refuse_mask: true"], expect_pass=False
+        )
+        assert [r.status for r in results] == ["error", "error"]
+        for table in tables:
+            assert not table_exists(project, table)
