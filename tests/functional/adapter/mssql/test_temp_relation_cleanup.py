@@ -124,6 +124,11 @@ unit_tests:
     given: []
     expect:
       rows: [{data: 1}]
+  - name: ut_compile_error
+    model: table_model
+    given: []
+    expect:
+      rows: [{nope: 1}]
 """
 
 # Divides by zero only when the rows are read, so the unit test's fixture table
@@ -157,6 +162,7 @@ class BaseUnitTestTempCleanup(BaseTempRelationCleanup):
         run_dbt(["run", "--select", "table_model"])
         results = run_dbt(["test", "--select", "test_type:unit"], expect_pass=False)
         assert sorted((r.node.name, str(r.status)) for r in results) == [
+            ("ut_compile_error", "error"),
             ("ut_error", "error"),
             ("ut_fail", "fail"),
             ("ut_pass", "pass"),

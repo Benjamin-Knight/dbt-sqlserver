@@ -1,12 +1,8 @@
 {#-
-    A copy of dbt-core's `materialization unit, default`
-    (global_project/macros/materializations/tests/unit.sql); keep in sync with
-    dbt-core when upgrading. The changes: the fixture table, which only
-    supplies the model's column types, is dropped and committed before
-    statement('main') instead of after it, and main runs with
-    auto_begin=False. The default drops the fixture after main, inside the
-    transaction main opens and never commits, so the drop rolls back
-    (dbt-labs/dbt#16499); and when main raises, the drop is never reached.
+    Copy of dbt-adapters' `materialization unit, default` (as of 1.24.5). The
+    changes: the fixture table is dropped straight after its column types are
+    read, so an error later cannot leak it, and main passes auto_begin=False,
+    which tests/unit/adapters/mssql/test_probe_auto_begin.py requires.
 -#}
 {%- materialization unit, adapter='sqlserver' -%}
 
@@ -22,7 +18,6 @@
   {% do run_query(get_create_table_as_sql(True, temp_relation, get_empty_subquery_sql(sql))) %}
   {%- set columns_in_relation = adapter.get_columns_in_relation(temp_relation) -%}
   {% do adapter.drop_relation(temp_relation) %}
-  {% do adapter.commit_if_open() %}
   {%- set column_name_to_data_types = {} -%}
   {%- set column_name_to_quoted = {} -%}
   {%- for column in columns_in_relation -%}
@@ -61,9 +56,11 @@
       {{ adapter.quote(target.schema) }}.{{ adapter.quote(test_view_name) }}
   {% endset %}
   {% set test_sql = main_sql.replace("'", "''")%}
-  {#- An error in the model aborts the batch before the drops at the end. With
-      a transaction open, XACT_ABORT dooms it and its rollback removes the
-      views; without one, the CATCH must drop them. -#}
+  {#- An error in the model aborts the batch before the drops at the end. Main
+      runs outside a transaction, so nothing rolls the views back and the CATCH
+      must drop them. The XACT_STATE() check covers a sql_header that opens
+      one: XACT_ABORT dooms it, and a drop there would fail and replace the
+      model's error. -#}
   BEGIN TRY
   EXEC('create view {{test_view}} as {{ test_sql }};')
 
