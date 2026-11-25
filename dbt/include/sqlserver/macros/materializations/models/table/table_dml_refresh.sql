@@ -2,9 +2,9 @@
     format string over the column, or none. = pads trailing spaces (and 0x00)
     even under BIN2, and compares datetimeoffset by instant, ignoring the
     offset. -#}
-{% macro sqlserver__delta_extra_key(column) %}
-  {%- set dtype = column.dtype | lower -%}
-  {%- if dtype in ['varchar', 'nvarchar', 'varbinary', 'sysname'] -%}
+{% macro sqlserver__delta_extra_key(column, types) %}
+  {%- set dtype = types[column.name | lower] -%}
+  {%- if dtype in ['varchar', 'nvarchar', 'varbinary'] -%}
     {{- return('DATALENGTH(%s)') -}}
   {%- elif dtype == 'datetimeoffset' -%}
     {{- return('DATEPART(TZOFFSET, %s)') -}}
@@ -14,11 +14,12 @@
 
 
 {#- Comparison keys for the delta swap: every column under its own collation,
-    plus its sqlserver__delta_extra_key. -#}
-{% macro sqlserver__delta_keys(columns, alias, named=true) %}
+    plus its sqlserver__delta_extra_key. types maps each lower-cased column
+    name to its base type (sqlserver__delta_probe). -#}
+{% macro sqlserver__delta_keys(columns, types, alias, named=true) %}
   {%- set keys = [] -%}
   {%- for col in columns -%}
-    {%- set extra = sqlserver__delta_extra_key(col) -%}
+    {%- set extra = sqlserver__delta_extra_key(col, types) -%}
     {%- do keys.append(alias ~ '.' ~ col.quoted) -%}
     {%- if extra -%}
       {%- do keys.append(extra % (alias ~ '.' ~ col.quoted) ~ (' AS [__dbt_x_' ~ loop.index ~ ']' if named else '')) -%}
@@ -28,12 +29,12 @@
 {% endmacro %}
 
 
-{% macro sqlserver__delta_key_names(columns, alias=none) %}
+{% macro sqlserver__delta_key_names(columns, types, alias=none) %}
   {%- set prefix = alias ~ '.' if alias else '' -%}
   {%- set names = [] -%}
   {%- for col in columns -%}
     {%- do names.append(prefix ~ col.quoted) -%}
-    {%- if sqlserver__delta_extra_key(col) -%}
+    {%- if sqlserver__delta_extra_key(col, types) -%}
       {%- do names.append(prefix ~ '[__dbt_x_' ~ loop.index ~ ']') -%}
     {%- endif -%}
   {%- endfor -%}
@@ -80,9 +81,9 @@
     another's. Rows equal under the GROUP BY (collation, extra key) always
     share a CHECKSUM, so no duplicate escapes the narrowing; the converse does
     not hold, hence the exact pass. -#}
-{% macro sqlserver__delta_dupes_sql(columns, relation, key_columns, query_label) %}
-  {%- set keys = sqlserver__delta_keys(columns, 's', named=false) -%}
-  {%- set keys_c = sqlserver__delta_keys(columns, 'c', named=false) -%}
+{% macro sqlserver__delta_dupes_sql(columns, types, relation, key_columns, query_label) %}
+  {%- set keys = sqlserver__delta_keys(columns, types, 's', named=false) -%}
+  {%- set keys_c = sqlserver__delta_keys(columns, types, 'c', named=false) -%}
   DECLARE @dbt_dupes bigint = 1;
   {% if key_columns %}
   SELECT @dbt_dupes = COUNT_BIG(*) FROM (
@@ -103,33 +104,65 @@
 {% endmacro %}
 
 
-{#- Types EXCEPT, INTERSECT and CHECKSUM cannot compare, and sql_variant,
-    whose = ignores trailing spaces and base-type changes. -#}
-{% macro sqlserver__delta_unsupported_columns(columns) %}
+{#- Why the delta cannot compare the table, or none.
+      unsupported type  EXCEPT, INTERSECT and CHECKSUM cannot compare it, or
+                        it is sql_variant, whose = ignores trailing spaces and
+                        base-type changes
+      collation         differs between the table and the new build: EXCEPT
+                        between them raises Msg 468
+      too many columns  the gone table, a column per key, passes SQL
+                        Server's 1024 -#}
+{% macro sqlserver__delta_blocker(columns, types, conflicts) %}
   {%- set unsupported = [] -%}
   {%- for col in columns -%}
-    {%- if col.dtype | lower in ['xml', 'text', 'ntext', 'image', 'geography', 'geometry', 'sql_variant'] -%}
+    {%- if types[col.name | lower] in ['xml', 'text', 'ntext', 'image', 'geography', 'geometry', 'sql_variant'] -%}
       {%- do unsupported.append(col.name) -%}
     {%- endif -%}
   {%- endfor -%}
-  {{- return(unsupported) -}}
+  {%- if unsupported -%}
+    {{- return("column(s) " ~ unsupported | join(', ') ~ " (unsupported type)") -}}
+  {%- elif conflicts -%}
+    {{- return("column(s) " ~ conflicts | join(', ') ~ " (collation differs from the new build)") -}}
+  {%- endif -%}
+  {%- set ns = namespace(key_count=columns | length) -%}
+  {%- for col in columns if sqlserver__delta_extra_key(col, types) -%}
+    {%- set ns.key_count = ns.key_count + 1 -%}
+  {%- endfor -%}
+  {%- set key_count = ns.key_count -%}
+  {%- if key_count + 1 > 1024 -%}
+    {{- return(key_count ~ " comparison keys (more than the 1023 a table can hold)") -}}
+  {%- endif -%}
+  {{- return(none) -}}
 {% endmacro %}
 
 
-{#- Columns whose collation differs between the two tables: EXCEPT between
-    them raises Msg 468. Read-only probe, so auto_begin=False (#819). -#}
-{% macro sqlserver__delta_collation_conflicts(target_relation, refresh_relation) %}
-  {% call statement('delta_collation_conflicts', fetch_result=True, auto_begin=False) -%}
+{#- Each target column's base type, lower-cased (an alias type's underlying
+    system type; CLR types share a system_type_id, so they keep their own
+    name), and the columns whose collation differs in the new build.
+    Read-only probe, so auto_begin=False (#819). -#}
+{% macro sqlserver__delta_probe(target_relation, refresh_relation) %}
+  {% call statement('delta_probe', fetch_result=True, auto_begin=False) -%}
     {{ get_use_database_sql(target_relation.database) }}
-    SELECT t.name COLLATE database_default AS column_name
+    SELECT LOWER(t.name) COLLATE database_default AS column_name,
+           LOWER(TYPE_NAME(IIF(ty.is_assembly_type = 1, t.user_type_id, t.system_type_id))) AS base_type,
+           IIF(s.collation_name <> t.collation_name, 1, 0) AS collation_conflict,
+           t.name AS original_name
     FROM sys.columns t
-    INNER JOIN sys.columns s ON s.name = t.name
+    INNER JOIN sys.types ty ON ty.user_type_id = t.user_type_id
+    LEFT JOIN sys.columns s
+      ON s.object_id = OBJECT_ID('{{ refresh_relation }}') AND s.name = t.name
     WHERE t.object_id = OBJECT_ID('{{ target_relation }}')
-      AND s.object_id = OBJECT_ID('{{ refresh_relation }}')
-      AND t.collation_name <> s.collation_name
     ORDER BY t.column_id;
   {%- endcall %}
-  {{- return(load_result('delta_collation_conflicts')['table'].columns[0].values() | list) -}}
+  {%- set types = {} -%}
+  {%- set conflicts = [] -%}
+  {%- for row in load_result('delta_probe')['table'].rows -%}
+    {%- do types.update({row[0]: row[1]}) -%}
+    {%- if row[2] == 1 -%}
+      {%- do conflicts.append(row[3]) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- return({'types': types, 'conflicts': conflicts}) -}}
 {% endmacro %}
 
 
@@ -140,7 +173,7 @@
     statement passes auto_begin=False. table.sql calls this before the in-tx
     pre-hooks under load (nothing open: each statement autocommits, so the
     scratch table's Sch-M ends with its create) and after them under build.
-    Returns the two relations the load and the tail need.
+    Returns the relations the load and the tail need, and the delta setup.
   -#}
   {%- set refresh_relation = target_relation.incorporate(
       path={"identifier": target_relation.identifier ~ '__dbt_refresh'}
@@ -157,9 +190,7 @@
     {{ get_use_database_sql(refresh_relation.database) }}
     DROP VIEW IF EXISTS {{ tmp_vw_relation.include(database=False) }};
     DROP TABLE IF EXISTS {{ refresh_relation }};
-    {% if refresh_method == 'delta' -%}
     DROP TABLE IF EXISTS {{ gone_relation }};
-    {%- endif %}
   {%- endcall %}
 
   {# Build new data into scratch table via temp view (handles CTEs in model SQL) #}
@@ -177,25 +208,28 @@
 
   {#- delta: the table of rows to delete, created empty here for the same
       reason as the scratch table (its Sch-M must not join the swap's
-      transaction). Shaped from the target's keys; unused if the schema
-      changed. -#}
+      transaction), and shaped from the target's keys. Skipped on a schema
+      change, which takes the rename-swap: the target's columns, delta_key
+      and the comparability checks describe the table being replaced. -#}
   {%- set use_delta = false -%}
   {%- set delta_key = [] -%}
-  {% if refresh_method == 'delta' %}
-    {%- set target_columns = adapter.get_columns_in_relation(target_relation) -%}
-    {%- set unsupported = sqlserver__delta_unsupported_columns(target_columns) -%}
+  {%- set delta_types = {} -%}
+  {%- set schema = check_for_schema_changes(refresh_relation, target_relation) if refresh_method == 'delta' else none -%}
+  {% if schema and not schema['schema_changed'] %}
+    {%- set target_columns = schema['target_columns'] -%}
     {%- set delta_key = sqlserver__delta_key_columns(target_columns, target_relation) -%}
-    {%- set conflicts = [] if unsupported else sqlserver__delta_collation_conflicts(target_relation, refresh_relation) -%}
-    {% if unsupported or conflicts %}
+    {%- set probe = sqlserver__delta_probe(target_relation, refresh_relation) -%}
+    {%- set delta_types = probe['types'] -%}
+    {%- set blocker = sqlserver__delta_blocker(target_columns, delta_types, probe['conflicts']) -%}
+    {% if blocker %}
       {% do exceptions.warn(
-        "table_refresh_method 'delta' cannot compare column(s) " ~ (unsupported or conflicts) | join(', ')
-        ~ " of " ~ target_relation ~ " (" ~ ("unsupported type" if unsupported else "collation differs from the new build")
-        ~ "); refreshing with a full DELETE + INSERT instead."
+        "table_refresh_method 'delta' cannot compare " ~ target_relation ~ ": " ~ blocker
+        ~ "; refreshing with a full DELETE + INSERT instead."
       ) %}
     {% else %}
       {%- set use_delta = true -%}
       {% call statement('dml_refresh_create_gone', auto_begin=False) -%}
-        SELECT TOP 0 {{ sqlserver__delta_keys(target_columns, 'l') }}, CAST(0 AS int) AS [__dbt_ck]
+        SELECT TOP 0 {{ sqlserver__delta_keys(target_columns, delta_types, 'l') }}, CAST(0 AS int) AS [__dbt_ck]
         INTO {{ gone_relation }}
         FROM {{ target_relation }} l;
       {%- endcall %}
@@ -207,7 +241,8 @@
     'tmp_vw_relation': tmp_vw_relation,
     'gone_relation': gone_relation,
     'use_delta': use_delta,
-    'delta_key': delta_key
+    'delta_key': delta_key,
+    'delta_types': delta_types
   }) }}
 {% endmacro %}
 
@@ -280,7 +315,8 @@
         in-tx post-hooks. -#}
     {% if stage['use_delta'] %}
       {%- set gone_relation = stage['gone_relation'] -%}
-      {%- set gone_names = sqlserver__delta_key_names(target_columns) -%}
+      {%- set types = stage['delta_types'] -%}
+      {%- set gone_names = sqlserver__delta_key_names(target_columns, types) -%}
       {%- set churn_cap = '@dbt_rows * 15 / 100' -%}
       {#- delta: delete only the target rows the new build lacks and insert
           only the rows the target lacks. Falls back to the full swap, in the
@@ -305,17 +341,17 @@
         DECLARE @dbt_rows bigint = (SELECT COUNT_BIG(*) FROM {{ refresh_relation }});
         DECLARE @dbt_path varchar(16) = 'delta';
 
-        {{ sqlserver__delta_dupes_sql(target_columns, refresh_relation, stage['delta_key'], query_label) }}
+        {{ sqlserver__delta_dupes_sql(target_columns, types, refresh_relation, stage['delta_key'], query_label) }}
         IF @dbt_dupes > 0
           SET @dbt_path = 'duplicates';
 
         IF @dbt_path = 'delta'
         BEGIN
           INSERT TOP ({{ churn_cap }} + 1) INTO {{ gone_relation }} WITH (TABLOCK) ({{ gone_names }}, [__dbt_ck])
-          SELECT {{ sqlserver__delta_key_names(target_columns, 'd') }}, CHECKSUM({{ sqlserver__delta_key_names(target_columns, 'd') }})
-          FROM (SELECT {{ sqlserver__delta_keys(target_columns, 'l') }} FROM {{ target_relation }} l WITH (TABLOCKX)
+          SELECT {{ sqlserver__delta_key_names(target_columns, types, 'd') }}, CHECKSUM({{ sqlserver__delta_key_names(target_columns, types, 'd') }})
+          FROM (SELECT {{ sqlserver__delta_keys(target_columns, types, 'l') }} FROM {{ target_relation }} l WITH (TABLOCKX)
                 EXCEPT
-                SELECT {{ sqlserver__delta_keys(target_columns, 's') }} FROM {{ refresh_relation }} s) d
+                SELECT {{ sqlserver__delta_keys(target_columns, types, 's') }} FROM {{ refresh_relation }} s) d
           {{ query_label }}
           IF @@ROWCOUNT > {{ churn_cap }}
             SET @dbt_path = 'churn';
@@ -326,17 +362,17 @@
           DELETE l FROM {{ target_relation }} l
           WHERE EXISTS (
             SELECT 1 FROM {{ gone_relation }} g
-            WHERE g.[__dbt_ck] = CHECKSUM({{ sqlserver__delta_keys(target_columns, 'l', named=false) }})
-              AND EXISTS (SELECT {{ sqlserver__delta_key_names(target_columns, 'g') }}
+            WHERE g.[__dbt_ck] = CHECKSUM({{ sqlserver__delta_keys(target_columns, types, 'l', named=false) }})
+              AND EXISTS (SELECT {{ sqlserver__delta_key_names(target_columns, types, 'g') }}
                           INTERSECT
-                          SELECT {{ sqlserver__delta_keys(target_columns, 'l', named=false) }}))
+                          SELECT {{ sqlserver__delta_keys(target_columns, types, 'l', named=false) }}))
           {{ query_label }}
 
           INSERT INTO {{ target_relation }} ({{ column_list }})
           SELECT {{ column_list }} FROM (
-            SELECT {{ sqlserver__delta_keys(target_columns, 's') }} FROM {{ refresh_relation }} s
+            SELECT {{ sqlserver__delta_keys(target_columns, types, 's') }} FROM {{ refresh_relation }} s
             EXCEPT
-            SELECT {{ sqlserver__delta_keys(target_columns, 'l') }} FROM {{ target_relation }} l) d
+            SELECT {{ sqlserver__delta_keys(target_columns, types, 'l') }} FROM {{ target_relation }} l) d
           {{ query_label }}
 
           IF (SELECT COUNT_BIG(*) FROM {{ target_relation }}) <> @dbt_rows

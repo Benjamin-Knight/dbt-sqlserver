@@ -3,13 +3,14 @@ import pytest
 from dbt.tests.util import get_connection, run_dbt, run_dbt_and_capture
 
 delta_model_sql = """
-{{ config(materialized="table", table_refresh_method="delta", as_columnstore=False) }}
+{{ config(materialized="table", table_refresh_method=var("method", "delta"),
+          as_columnstore=False) }}
 select id, val, ci_val, sys_val, at_tz, loaded_at from {{ target.schema }}.delta_src
 """
 
 delta_variant_model_sql = """
 {{ config(materialized="table", table_refresh_method="delta", as_columnstore=False) }}
-select 1 as id, cast('a' as sql_variant) as doc
+select 1 as id, cast('a' as sql_variant) as doc{% if var("extra", false) %}, 2 as extra{% endif %}
 """
 
 
@@ -39,9 +40,19 @@ def differences(project):
     )[0][0]
 
 
-def refresh(project, expect_pass=True, model="delta_model"):
+def leftovers(project):
+    return execute(
+        project,
+        f"SELECT COUNT(*) AS leftovers FROM sys.tables"
+        f" WHERE schema_id = SCHEMA_ID('{project.test_schema}') AND name LIKE '%[_][_]dbt[_]%'",
+        fetch=True,
+    )[0][0]
+
+
+def refresh(project, expect_pass=True, model="delta_model", vars=None):
     """Run the model; return the reason it fell back to the full swap, or None."""
-    _, log = run_dbt_and_capture(["run", "--select", model], expect_pass=expect_pass)
+    args = ["run", "--select", model] + (["--vars", vars] if vars else [])
+    _, log = run_dbt_and_capture(args, expect_pass=expect_pass)
     marker = "fell back to the full swap: "
     return next(
         (line.split(marker)[1].strip() for line in log.splitlines() if marker in line), None
@@ -129,7 +140,8 @@ class TestDeltaRefresh:
         assert refresh(project) == "count"
         assert differences(project) == 0
 
-        # A swap that fails part-way rolls back whole, and the next run clears its leftovers.
+        # A swap that fails part-way rolls back whole, and the next run clears its leftovers,
+        # even under another method.
         execute(
             project,
             f"""
@@ -142,8 +154,9 @@ class TestDeltaRefresh:
         refresh(project, expect_pass=False)
         assert differences(project) == 2
         execute(project, f"DELETE {s}.delta_src WHERE id = 1000")
-        assert refresh(project) is None
+        run_dbt(["run", "--select", "delta_model", "--vars", "method: dml"])
         assert differences(project) == 0
+        assert leftovers(project) == 0
 
         # The build's collation no longer matches the target's: EXCEPT cannot compare them.
         execute(
@@ -155,23 +168,20 @@ class TestDeltaRefresh:
             """,
         )
         _, log = run_dbt_and_capture(["run", "--select", "delta_model"])
-        assert "cannot compare column(s) ci_val" in log
+        assert "column(s) ci_val (collation differs" in log
         assert ci_val(30) == "Abc"
 
-        assert (
-            execute(
-                project,
-                f"SELECT COUNT(*) AS leftovers FROM sys.tables"
-                f" WHERE schema_id = SCHEMA_ID('{s}') AND name LIKE '%[_][_]dbt[_]%'",
-                fetch=True,
-            )[0][0]
-            == 0
-        )
+        assert leftovers(project) == 0
 
     def test_unsupported_type_warns_and_swaps(self, project):
         run_dbt(["run", "--select", "delta_variant_model"])
         _, log = run_dbt_and_capture(["run", "--select", "delta_variant_model"])
-        assert "cannot compare column(s) doc" in log
+        assert "column(s) doc (unsupported type)" in log
+        # A schema change takes the rename-swap, so the delta has nothing to warn about.
+        _, log = run_dbt_and_capture(
+            ["run", "--select", "delta_variant_model", "--vars", "extra: true"]
+        )
+        assert "cannot compare" not in log
         assert (
             execute(
                 project,
@@ -203,6 +213,13 @@ delta_composite_key_model_sql = """
 select id, grp, val from {{ target.schema }}.key_src
 """
 
+delta_new_key_model_sql = """
+{{ config(materialized="table", table_refresh_method="delta", delta_key=var("key", "id"),
+          as_columnstore=False) }}
+select id{% if var("key", "id") == "new_id" %}, id * 10 as new_id{% endif %}
+from {{ target.schema }}.new_key_src
+"""
+
 delta_bad_key_model_sql = """
 {{ config(materialized="table", table_refresh_method="delta", delta_key=["id", "nope"],
           as_columnstore=False) }}
@@ -217,6 +234,7 @@ class TestDeltaKey:
             "key_model.sql": delta_key_model_sql,
             "key_composite_model.sql": delta_composite_key_model_sql,
             "key_bad_model.sql": delta_bad_key_model_sql,
+            "key_new_model.sql": delta_new_key_model_sql,
         }
 
     def test_key_narrows_the_check_without_trusting_it(self, project):
@@ -250,6 +268,18 @@ class TestDeltaKey:
         assert (
             execute(project, f"SELECT COUNT(*) FROM {s}.key_model", fetch=True)[0][0]
             == execute(project, f"SELECT COUNT(*) FROM {s}.key_src", fetch=True)[0][0]
+        )
+
+    def test_key_added_with_its_column_takes_the_rename_swap(self, project):
+        s = project.test_schema
+        execute(project, f"SELECT 1 AS id INTO {s}.new_key_src")
+        run_dbt(["run", "--select", "key_new_model"])
+        # The run that adds the key column takes the rename-swap; the next uses the key.
+        assert refresh(project, model="key_new_model", vars="key: new_id") is None
+        execute(project, f"INSERT {s}.new_key_src VALUES (2)")
+        assert refresh(project, model="key_new_model", vars="key: new_id") is None
+        assert (
+            execute(project, f"SELECT SUM(new_id) FROM {s}.key_new_model", fetch=True)[0][0] == 30
         )
 
     def test_unknown_key_column_is_named(self, project):
@@ -340,3 +370,89 @@ class TestDeltaDuplicateCheckEquality:
         # NULLs compare equal to each other, and 0 equals -0.
         execute(project, f"INSERT {s}.ci_src VALUES (3, NULL, NULL, NULL, NULL)")
         assert refresh(project, model="ci_model") == "duplicates"
+
+
+delta_alias_model_sql = """
+{{ config(materialized="table", table_refresh_method="delta", as_columnstore=False) }}
+select id, code, note from {{ target.schema }}.alias_src
+"""
+
+delta_text_alias_model_sql = """
+{{ config(materialized="table", table_refresh_method="delta", as_columnstore=False) }}
+select id, body from {{ target.schema }}.text_alias_src
+"""
+
+delta_wide_model_sql = """
+{{ config(materialized="table", table_refresh_method="delta", as_columnstore=False) }}
+select 1 as id{% for i in range(520) %}, cast('x' as varchar(5)) as c{{ i }}{% endfor %}
+"""
+
+
+class TestDeltaComparability:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "alias_model.sql": delta_alias_model_sql,
+            "text_alias_model.sql": delta_text_alias_model_sql,
+            "wide_model.sql": delta_wide_model_sql,
+        }
+
+    def test_alias_types_compare_as_their_base_type(self, project):
+        s = project.test_schema
+        execute(
+            project,
+            f"""
+            CREATE TYPE {s}.code_t FROM varchar(10);
+            CREATE TYPE {s}.text_t FROM text;
+            """,
+        )
+        execute(
+            project,
+            f"""
+            CREATE TABLE {s}.alias_src (id int, code {s}.code_t, note {s}.code_t);
+            INSERT {s}.alias_src SELECT TOP (100) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)),
+              'a', 'n' FROM sys.all_objects;
+            CREATE TABLE {s}.text_alias_src (id int, body {s}.text_t);
+            INSERT {s}.text_alias_src VALUES (1, 'a');
+            """,
+        )
+        try:
+            run_dbt(["run", "--select", "alias_model", "text_alias_model"])
+
+            # A trailing-space change to a varchar alias is written.
+            execute(project, f"UPDATE {s}.alias_src SET code = 'a ' WHERE id = 1")
+            assert refresh(project, model="alias_model") is None
+            assert (
+                execute(
+                    project, f"SELECT DATALENGTH(code) FROM {s}.alias_model WHERE id = 1", True
+                )[0][0]
+                == 2
+            )
+
+            # A text alias cannot be compared: warn and take the full swap.
+            execute(project, f"UPDATE {s}.text_alias_src SET body = 'b'")
+            _, log = run_dbt_and_capture(["run", "--select", "text_alias_model"])
+            assert "column(s) body (unsupported type)" in log
+            assert (
+                execute(
+                    project,
+                    f"SELECT CAST(body AS varchar(10)) FROM {s}.text_alias_model",
+                    True,
+                )[0][0]
+                == "b"
+            )
+        finally:
+            execute(
+                project,
+                f"""
+                DROP TABLE IF EXISTS {s}.alias_model, {s}.alias_src,
+                  {s}.text_alias_model, {s}.text_alias_src;
+                DROP TYPE IF EXISTS {s}.code_t;
+                DROP TYPE IF EXISTS {s}.text_t;
+                """,
+            )
+
+    def test_too_many_keys_for_the_gone_table_takes_the_full_swap(self, project):
+        run_dbt(["run", "--select", "wide_model"])
+        _, log = run_dbt_and_capture(["run", "--select", "wide_model"])
+        assert "1041 comparison keys" in log

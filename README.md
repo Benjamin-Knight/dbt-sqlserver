@@ -314,15 +314,15 @@ _(default: `rename`)_ How a `table` model replaces a table that already exists.
 
 `dml` and `delta` fall back to a rename-swap on a run that changes the model's columns.
 
-`delta` compares whole rows, each column under its own collation, variable-length string and binary columns by byte length as well, so a trailing-space change counts, and `datetimeoffset` columns by offset as well, so an offset change that keeps the instant counts. It takes the full `dml` swap, in the same transaction, when the new build holds duplicate rows, when more than 15% of the rows would be deleted, or when the row count is wrong afterwards (the table held duplicates); the run logs which. It suits large tables where little changes between runs. A model that stamps every row, such as `current_timestamp as loaded_at`, changes 100% of them and should use `dml`.
+`delta` compares whole rows, each column under its own collation, variable-length string and binary columns by byte length as well, so a trailing-space change counts, and `datetimeoffset` columns by offset as well, so an offset change that keeps the instant counts. It takes the full `dml` swap, in the same transaction, when the new build holds duplicate rows, when more than 15% of the rows would be deleted, or when the row count is wrong afterwards (the table held duplicates); the run logs which. It suits large tables where little changes between runs. Set `delta_key` (a column or list of columns) to a key that is unique in the model, and the duplicate check skips its full-row comparison while the key stays unique. A model that stamps every row, such as `current_timestamp as loaded_at`, changes 100% of them and should use `dml`.
 
 Known limitations of `delta`:
 
-- A change that is equal under the column's collation is not written. Under a case-insensitive collation, `abc` becoming `ABC` leaves `abc` in the table until another column of that row changes.
+- A change that is equal under the column's collation is not written. Under a case-insensitive collation, `abc` becoming `ABC` leaves `abc` in the table until another column of that row changes or a run takes the full swap.
 - If a column's collation differs between the table and the new build (the model or its source changed collation), the run warns and takes the full swap, on every run until the table is rebuilt: one run with `table_refresh_method: rename`, or a `--full-refresh` with `full_refresh_build: prebuilt`.
-- A table with an `xml`, `text`, `ntext`, `image`, `geography`, `geometry` or `sql_variant` column cannot be compared: the run warns and takes the full swap.
-- A column of an alias type is compared by value only, so a trailing-space-only or offset-only change in it is not written (`sysname` is handled).
-- The comparison reads the table, so the dbt login must see its masked columns unmasked.
+- A table with an `xml`, `text`, `ntext`, `image`, `geography`, `geometry` or `sql_variant` column (or an alias type over one) cannot be compared: the run warns and takes the full swap.
+- So does a table whose columns, plus one more for each variable-length string, binary or `datetimeoffset` column, number more than 1023.
+- On a table with masked columns, a dbt login without `UNMASK` takes the full swap on any run that changes a row.
 
 ### Ephemeral models
 
