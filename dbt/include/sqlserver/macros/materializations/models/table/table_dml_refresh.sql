@@ -1,18 +1,27 @@
-{#- = pads trailing spaces (and 0x00) even under BIN2, so these types are
-    also compared on DATALENGTH. -#}
-{% macro sqlserver__delta_has_length_key(column) %}
-  {{- return(column.dtype | lower in ['varchar', 'nvarchar', 'varbinary', 'sysname']) -}}
+{#- The second key a column needs because = misses a change to it, as a
+    format string over the column, or none. = pads trailing spaces (and 0x00)
+    even under BIN2, and compares datetimeoffset by instant, ignoring the
+    offset. -#}
+{% macro sqlserver__delta_extra_key(column) %}
+  {%- set dtype = column.dtype | lower -%}
+  {%- if dtype in ['varchar', 'nvarchar', 'varbinary', 'sysname'] -%}
+    {{- return('DATALENGTH(%s)') -}}
+  {%- elif dtype == 'datetimeoffset' -%}
+    {{- return('DATEPART(TZOFFSET, %s)') -}}
+  {%- endif -%}
+  {{- return(none) -}}
 {% endmacro %}
 
 
 {#- Comparison keys for the delta swap: every column under its own collation,
-    plus a DATALENGTH key where sqlserver__delta_has_length_key asks for one. -#}
+    plus its sqlserver__delta_extra_key. -#}
 {% macro sqlserver__delta_keys(columns, alias, named=true) %}
   {%- set keys = [] -%}
   {%- for col in columns -%}
+    {%- set extra = sqlserver__delta_extra_key(col) -%}
     {%- do keys.append(alias ~ '.' ~ col.quoted) -%}
-    {%- if sqlserver__delta_has_length_key(col) -%}
-      {%- do keys.append('DATALENGTH(' ~ alias ~ '.' ~ col.quoted ~ ')' ~ (' AS [__dbt_dl_' ~ loop.index ~ ']' if named else '')) -%}
+    {%- if extra -%}
+      {%- do keys.append(extra % (alias ~ '.' ~ col.quoted) ~ (' AS [__dbt_x_' ~ loop.index ~ ']' if named else '')) -%}
     {%- endif -%}
   {%- endfor -%}
   {{- return(keys | join(', ')) -}}
@@ -24,16 +33,14 @@
   {%- set names = [] -%}
   {%- for col in columns -%}
     {%- do names.append(prefix ~ col.quoted) -%}
-    {%- if sqlserver__delta_has_length_key(col) -%}
-      {%- do names.append(prefix ~ '[__dbt_dl_' ~ loop.index ~ ']') -%}
+    {%- if sqlserver__delta_extra_key(col) -%}
+      {%- do names.append(prefix ~ '[__dbt_x_' ~ loop.index ~ ']') -%}
     {%- endif -%}
   {%- endfor -%}
   {{- return(names | join(', ')) -}}
 {% endmacro %}
 
 
-{#- The delta_key config as the target's quoted column names, or [] when unset.
-    A name the target lacks raises here, before any scratch load. -#}
 {% macro sqlserver__delta_key_columns(columns, relation) %}
   {%- set configured = config.get('delta_key') -%}
   {%- if not configured -%}
@@ -70,7 +77,7 @@
 
     The exact check hash-aggregates every column, which sizes its memory grant
     by row width, so it runs only over rows whose CHECKSUM collides with
-    another's. Rows equal under the GROUP BY (collation, DATALENGTH) always
+    another's. Rows equal under the GROUP BY (collation, extra key) always
     share a CHECKSUM, so no duplicate escapes the narrowing; the converse does
     not hold, hence the exact pass. -#}
 {% macro sqlserver__delta_dupes_sql(columns, relation, key_columns, query_label) %}

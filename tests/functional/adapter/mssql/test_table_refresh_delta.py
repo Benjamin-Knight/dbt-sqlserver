@@ -4,7 +4,7 @@ from dbt.tests.util import get_connection, run_dbt, run_dbt_and_capture
 
 delta_model_sql = """
 {{ config(materialized="table", table_refresh_method="delta", as_columnstore=False) }}
-select id, val, ci_val, sys_val, loaded_at from {{ target.schema }}.delta_src
+select id, val, ci_val, sys_val, at_tz, loaded_at from {{ target.schema }}.delta_src
 """
 
 delta_variant_model_sql = """
@@ -20,10 +20,12 @@ def execute(project, sql, fetch=False):
 
 
 def differences(project):
-    """Rows whose value, byte length or number of copies differs between model and source."""
+    """Rows whose value, byte length, offset or copy count differs between model and source."""
     keys = "id, val, DATALENGTH(val), ci_val, DATALENGTH(ci_val), sys_val, DATALENGTH(sys_val)"
-    keys = f"{keys}, loaded_at".replace("ci_val", "ci_val COLLATE Latin1_General_CI_AS")
-    names = "id, val, val_len, ci_val, ci_len, sys_val, sys_len, loaded_at"
+    keys = f"{keys}, at_tz, DATEPART(TZOFFSET, at_tz), loaded_at".replace(
+        "ci_val", "ci_val COLLATE Latin1_General_CI_AS"
+    )
+    names = "id, val, val_len, ci_val, ci_len, sys_val, sys_len, at_tz, tz, loaded_at"
     src, live = (
         f"SELECT {names}, COUNT(*) AS copies"
         f" FROM (SELECT {keys} FROM {project.test_schema}.{table}) t ({names}) GROUP BY {names}"
@@ -69,11 +71,13 @@ class TestDeltaRefresh:
             CREATE TABLE {s}.delta_src (
               id int NOT NULL, val varchar(20) NULL,
               ci_val varchar(20) COLLATE Latin1_General_CI_AS NULL,
-              sys_val sysname NOT NULL, loaded_at datetime2 NOT NULL);
+              sys_val sysname NOT NULL, at_tz datetimeoffset NOT NULL,
+              loaded_at datetime2 NOT NULL);
             WITH n AS (SELECT TOP (100) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)) AS n
                        FROM sys.all_objects)
             INSERT {s}.delta_src
-            SELECT n, IIF(n % 10 = 0, NULL, CONCAT('v', n)), 'abc', 's', '2026-01-01' FROM n;
+            SELECT n, IIF(n % 10 = 0, NULL, CONCAT('v', n)), 'abc', 's',
+                   '2026-01-01 10:00 +00:00', '2026-01-01' FROM n;
             """,
         )
         run_dbt(["run", "--select", "delta_model"])  # creates the table; no swap yet
@@ -81,7 +85,8 @@ class TestDeltaRefresh:
         assert refresh(project) is None
         assert differences(project) == 0
 
-        # A few rows, a NULL becoming a value, and trailing-space-only changes.
+        # A few rows, a NULL becoming a value, and changes = misses: trailing spaces, and an
+        # offset that keeps the instant.
         execute(
             project,
             f"""
@@ -89,6 +94,7 @@ class TestDeltaRefresh:
             UPDATE {s}.delta_src SET val = 'filled' WHERE id = 10;
             UPDATE {s}.delta_src SET val = 'v21 ' WHERE id = 21;
             UPDATE {s}.delta_src SET sys_val = 's ' WHERE id = 22;
+            UPDATE {s}.delta_src SET at_tz = SWITCHOFFSET(at_tz, '+01:00') WHERE id = 23;
             """,
         )
         assert refresh(project) is None
@@ -129,7 +135,7 @@ class TestDeltaRefresh:
             f"""
             ALTER TABLE {s}.delta_model ADD CONSTRAINT delta_ck CHECK (id < 1000);
             DELETE {s}.delta_src WHERE id = 99;
-            INSERT {s}.delta_src SELECT 1000, val, ci_val, sys_val, loaded_at
+            INSERT {s}.delta_src SELECT 1000, val, ci_val, sys_val, at_tz, loaded_at
             FROM {s}.delta_src WHERE id = 1;
             """,
         )
