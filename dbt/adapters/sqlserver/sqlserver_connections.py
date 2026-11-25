@@ -51,7 +51,6 @@ from dbt.adapters.sqlserver.sqlserver_backend import (
     handle_backend_database_error,
     is_pyodbc_handle,
     log_connection_string,
-    warning_sqlstate,
 )
 from dbt.adapters.sqlserver.sqlserver_constants import datatypes
 from dbt.adapters.sqlserver.sqlserver_credentials import SQLServerCredentials
@@ -419,13 +418,9 @@ class SQLServerConnectionManager(SQLConnectionManager):
             else:
                 database_error = _RUNTIME_STATE.get_pyodbc_database_error()
 
-            if (database_error is not None and isinstance(e, database_error)) or warning_sqlstate(
-                e
-            ) is not None:
-                # The backend-specific handler releases the connection and raises
-                # DbtDatabaseError, so this branch must not fall through into the
-                # generic rollback / logging path below.
-                handle_backend_database_error(e, database_error, self.release)
+            # Raises DbtDatabaseError for a database error or a masking warning;
+            # returns for anything else, which takes the generic path below.
+            handle_backend_database_error(e, database_error, self.release)
 
             logger.debug(f"SQL execution raised {type(e).__name__}: {e}")
             logger.debug(f"Error running SQL: {sql}")
