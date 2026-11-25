@@ -320,7 +320,7 @@ Known limitations of `delta`:
 
 - A change that is equal under the column's collation is not written. Under a case-insensitive collation, `abc` becoming `ABC` leaves `abc` in the table until another column of that row changes or a run takes the full swap.
 - If a column's collation differs between the table and the new build (the model or its source changed collation), the run warns and takes the full swap, on every run until the table is rebuilt: one run with `table_refresh_method: rename`, or a `--full-refresh` with `full_refresh_build: prebuilt`.
-- A table with an `xml`, `text`, `ntext`, `image`, `geography`, `geometry` or `sql_variant` column (or an alias type over one) cannot be compared: the run warns and takes the full swap.
+- A table with an `xml`, `text`, `ntext`, `image`, `geography`, `geometry`, `sql_variant`, `json` or `vector` column (or an alias type over one) cannot be compared: the run warns and takes the full swap.
 - So does a table whose columns, plus one more for each variable-length string, binary or `datetimeoffset` column, number more than 1023.
 - On a table with masked columns, a dbt login without `UNMASK` takes the full swap on any run that changes a row.
 

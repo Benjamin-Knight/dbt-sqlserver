@@ -382,6 +382,11 @@ delta_text_alias_model_sql = """
 select id, body from {{ target.schema }}.text_alias_src
 """
 
+delta_json_vector_model_sql = """
+{{ config(materialized="table", table_refresh_method="delta", as_columnstore=False) }}
+select id, doc, vec from {{ target.schema }}.json_vector_src
+"""
+
 delta_wide_model_sql = """
 {{ config(materialized="table", table_refresh_method="delta", as_columnstore=False) }}
 select 1 as id{% for i in range(520) %}, cast('x' as varchar(5)) as c{{ i }}{% endfor %}
@@ -395,6 +400,7 @@ class TestDeltaComparability:
             "alias_model.sql": delta_alias_model_sql,
             "text_alias_model.sql": delta_text_alias_model_sql,
             "wide_model.sql": delta_wide_model_sql,
+            "json_vector_model.sql": delta_json_vector_model_sql,
         }
 
     def test_alias_types_compare_as_their_base_type(self, project):
@@ -456,3 +462,28 @@ class TestDeltaComparability:
         run_dbt(["run", "--select", "wide_model"])
         _, log = run_dbt_and_capture(["run", "--select", "wide_model"])
         assert "1041 comparison keys" in log
+
+    def test_json_and_vector_warn_and_swap(self, project):
+        major = execute(project, "SELECT SERVERPROPERTY('ProductMajorVersion')", True)[0][0]
+        if int(major) < 17:
+            pytest.skip("json and vector need SQL Server 2025")
+        s = project.test_schema
+        execute(
+            project,
+            f"""
+            CREATE TABLE {s}.json_vector_src (id int, doc json, vec vector(3));
+            INSERT {s}.json_vector_src VALUES (1, '{{"a":1}}', '[1,2,3]');
+            """,
+        )
+        run_dbt(["run", "--select", "json_vector_model"])
+        execute(
+            project,
+            f"UPDATE {s}.json_vector_src SET doc = '{{\"a\":2}}', vec = '[1,2,4]'",
+        )
+        _, log = run_dbt_and_capture(["run", "--select", "json_vector_model"])
+        assert "column(s) doc, vec (unsupported type)" in log
+        values = "SELECT CAST(doc AS nvarchar(20)), CAST(vec AS nvarchar(60)) FROM"
+        assert (
+            execute(project, f"{values} {s}.json_vector_model", True)[0]
+            == execute(project, f"{values} {s}.json_vector_src", True)[0]
+        )

@@ -4,7 +4,7 @@
     offset. -#}
 {% macro sqlserver__delta_extra_key(column, types) %}
   {%- set dtype = types[column.name | lower] -%}
-  {%- if dtype in ['varchar', 'nvarchar', 'varbinary'] -%}
+  {%- if dtype in ['varchar', 'nvarchar', 'varbinary', 'sysname'] -%}
     {{- return('DATALENGTH(%s)') -}}
   {%- elif dtype == 'datetimeoffset' -%}
     {{- return('DATEPART(TZOFFSET, %s)') -}}
@@ -105,7 +105,7 @@
 
 
 {#- Why the delta cannot compare the table, or none.
-      unsupported type  EXCEPT, INTERSECT and CHECKSUM cannot compare it, or
+      unsupported type  EXCEPT, INTERSECT or CHECKSUM cannot compare it, or
                         it is sql_variant, whose = ignores trailing spaces and
                         base-type changes
       collation         differs between the table and the new build: EXCEPT
@@ -115,7 +115,7 @@
 {% macro sqlserver__delta_blocker(columns, types, conflicts) %}
   {%- set unsupported = [] -%}
   {%- for col in columns -%}
-    {%- if types[col.name | lower] in ['xml', 'text', 'ntext', 'image', 'geography', 'geometry', 'sql_variant'] -%}
+    {%- if types[col.name | lower] in ['xml', 'text', 'ntext', 'image', 'geography', 'geometry', 'sql_variant', 'json', 'vector'] -%}
       {%- do unsupported.append(col.name) -%}
     {%- endif -%}
   {%- endfor -%}
@@ -136,15 +136,17 @@
 {% endmacro %}
 
 
-{#- Each target column's base type, lower-cased (an alias type's underlying
-    system type; CLR types share a system_type_id, so they keep their own
-    name), and the columns whose collation differs in the new build.
+{#- Each target column's type, lower-cased, with an alias type resolved to
+    its system type, and the columns whose collation differs in the new
+    build. Only aliases are resolved: other types can share a system_type_id
+    (vector's is varbinary's, the CLR types share one).
     Read-only probe, so auto_begin=False (#819). -#}
 {% macro sqlserver__delta_probe(target_relation, refresh_relation) %}
   {% call statement('delta_probe', fetch_result=True, auto_begin=False) -%}
     {{ get_use_database_sql(target_relation.database) }}
     SELECT LOWER(t.name) COLLATE database_default AS column_name,
-           LOWER(TYPE_NAME(IIF(ty.is_assembly_type = 1, t.user_type_id, t.system_type_id))) AS base_type,
+           LOWER(IIF(ty.is_user_defined = 1 AND ty.is_assembly_type = 0,
+                      TYPE_NAME(t.system_type_id), ty.name)) AS base_type,
            IIF(s.collation_name <> t.collation_name, 1, 0) AS collation_conflict,
            t.name AS original_name
     FROM sys.columns t
