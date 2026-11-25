@@ -77,6 +77,21 @@ def _cursor_is_adbc(cursor: Any) -> bool:
     return type(cursor).__module__ == "adbc_driver_manager.dbapi"
 
 
+def _mssql_python_cursor_cancel(cursor: Any) -> Optional[Any]:
+    """Return SQLCancel for an mssql-python cursor, or None.
+
+    mssql-python has no public ``Cursor.cancel()`` (microsoft/mssql-python#424),
+    so ``Cursor.hstmt._cancel`` -- the SQLCancel binding the driver itself uses
+    to unblock a fetch running on another thread -- is the only cross-thread
+    cancellation it exposes. Gated on the cursor's module and feature-detected
+    so a public ``cancel()`` takes over as soon as the driver ships one.
+    """
+    if type(cursor).__module__.split(".")[0] != "mssql_python":
+        return None
+    cancel = getattr(getattr(cursor, "hstmt", None), "_cancel", None)
+    return cancel if callable(cancel) else None
+
+
 def _skip_quoted_span(sql: str, i: int) -> Optional[int]:
     """If ``sql[i]`` opens a bracket-quoted identifier (``[...]``) or a
     single-quoted string literal (``'...'``), return the index just past
@@ -536,11 +551,12 @@ class SQLServerConnectionManager(SQLConnectionManager):
         run is interrupted (Ctrl-C) or another thread errors. We cancel by
         calling ``Cursor.cancel()`` on the connection's in-flight cursor:
         pyodbc exposes it and it is explicitly designed to be called from
-        another thread (it issues ``SQLCancel``); mssql-python's cursor is
-        used the same way when it supports it. Cancellation targets statement
-        execution. If no statement is in flight, the cursor is gone, or the
-        backend cursor does not support cancellation, this is a best-effort
-        no-op.
+        another thread (it issues ``SQLCancel``); ADBC cursors expose the
+        statement-level ``adbc_cancel()``, and mssql-python cursors expose
+        SQLCancel only on their statement handle, so both are probed as
+        fallbacks. Cancellation targets statement execution. If no statement is
+        in flight, the cursor is gone, or the backend cursor does not support
+        cancellation, this is a best-effort no-op.
         """
 
         cursor = getattr(connection, _IN_FLIGHT_CURSOR_ATTR, None)
@@ -548,7 +564,13 @@ class SQLServerConnectionManager(SQLConnectionManager):
             logger.debug(f"No in-flight query to cancel for connection {connection.name}.")
             return
 
+        # ``cancel()`` is probed first so pyodbc keeps the path it already had;
+        # neither ADBC's DB-API cursor nor mssql-python's provides it.
         cancel_cursor = getattr(cursor, "cancel", None)
+        if not callable(cancel_cursor):
+            cancel_cursor = getattr(cursor, "adbc_cancel", None)
+        if not callable(cancel_cursor):
+            cancel_cursor = _mssql_python_cursor_cancel(cursor)
         if not callable(cancel_cursor):
             logger.debug(
                 f"Backend cursor for connection {connection.name} does not "
@@ -688,7 +710,7 @@ class SQLServerConnectionManager(SQLConnectionManager):
                 )
             )
 
-            pre = time.time()
+            pre = time.perf_counter()
 
             cursor = connection.handle.cursor()
             # Track the in-flight cursor so cancel() / cancel_open() can stop it
@@ -717,7 +739,7 @@ class SQLServerConnectionManager(SQLConnectionManager):
             fire_event(
                 SQLQueryStatus(
                     status=str(self.get_response(cursor)),
-                    elapsed=round((time.time() - pre)),
+                    elapsed=time.perf_counter() - pre,
                     node_info=get_node_info(),
                 )
             )

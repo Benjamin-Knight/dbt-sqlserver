@@ -43,6 +43,7 @@ from dbt.adapters.sqlserver.sqlserver_helpers import (
     format_connection_string_value,
     is_mssql_python_backend,
     sanitize_connection_string_for_logging,
+    split_connection_string_parts,
     validate_connection_requirements,
     validate_mssql_python_requirements,
     validate_pyodbc_requirements,
@@ -1485,6 +1486,19 @@ def test_open_with_mssql_python_backend_enables_pooling(
     assert fake_module.InternalError in captured["retryable_exceptions"]
 
 
+@pytest.mark.parametrize(
+    "build", [_build_pyodbc_connection_string, _build_mssql_python_connection_string]
+)
+def test_connection_string_keeps_database_name_in_one_segment(
+    credentials: SQLServerCredentials, build
+) -> None:
+    credentials.database = "sales;APP=evil"
+
+    parts = split_connection_string_parts(build(credentials))
+
+    assert "Database={sales;APP=evil}" in parts
+
+
 def test_open_with_mssql_python_backend_fails_fast_for_pyodbc_token_auth_aliases(
     credentials: SQLServerCredentials, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2141,6 +2155,55 @@ def test_cancel_handles_cursor_without_cancel_support() -> None:
     connection = SimpleNamespace(name="conn-1", _dbt_sqlserver_in_flight_cursor=object())
 
     manager.cancel(connection)
+
+
+def test_cancel_falls_back_to_adbc_cancel() -> None:
+    manager = object.__new__(SQLServerConnectionManager)
+    # ADBC's DB-API cursor exposes only the statement-level adbc_cancel().
+    adbc_cancel = MagicMock()
+    connection = SimpleNamespace(
+        name="conn-1",
+        _dbt_sqlserver_in_flight_cursor=SimpleNamespace(adbc_cancel=adbc_cancel),
+    )
+
+    manager.cancel(connection)
+
+    adbc_cancel.assert_called_once_with()
+
+
+class _MssqlPythonCursor:
+    """Stands in for mssql_python.Cursor: no cancel(), SQLCancel on the handle."""
+
+    __module__ = "mssql_python.cursor"
+
+    def __init__(self, cancel: MagicMock) -> None:
+        self.hstmt = SimpleNamespace(_cancel=cancel)
+
+
+def test_cancel_falls_back_to_mssql_python_statement_handle() -> None:
+    manager = object.__new__(SQLServerConnectionManager)
+    sqlcancel = MagicMock()
+    connection = SimpleNamespace(
+        name="conn-1",
+        _dbt_sqlserver_in_flight_cursor=_MssqlPythonCursor(sqlcancel),
+    )
+
+    manager.cancel(connection)
+
+    sqlcancel.assert_called_once_with()
+
+
+def test_cancel_ignores_statement_handle_of_other_drivers() -> None:
+    manager = object.__new__(SQLServerConnectionManager)
+    # Only mssql-python's handle carries this; reaching into another driver's
+    # handle would cancel on a guess.
+    sqlcancel = MagicMock()
+    cursor = SimpleNamespace(hstmt=SimpleNamespace(_cancel=sqlcancel))
+    connection = SimpleNamespace(name="conn-1", _dbt_sqlserver_in_flight_cursor=cursor)
+
+    manager.cancel(connection)
+
+    sqlcancel.assert_not_called()
 
 
 def test_cancel_swallows_errors_from_cursor_cancel() -> None:
