@@ -471,8 +471,9 @@ class TestDeltaComparability:
         assert "1041 comparison keys" in log
 
     def test_json_and_vector_warn_and_swap(self, project):
-        major = execute(project, "SELECT SERVERPROPERTY('ProductMajorVersion')", True)[0][0]
-        if int(major) < 17:
+        # sql_variant comes back driver-encoded on ADBC; cast it server-side.
+        version = "SELECT CAST(SERVERPROPERTY('ProductMajorVersion') AS int)"
+        if execute(project, version, True)[0][0] < 17:
             pytest.skip("json and vector need SQL Server 2025")
         s = project.test_schema
         execute(
