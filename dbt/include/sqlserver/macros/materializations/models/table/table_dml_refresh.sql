@@ -168,6 +168,20 @@
 {% endmacro %}
 
 
+{#- The delta_max_churn_percent config: past this share of the build's rows
+    deleted, the delta takes the full swap. -#}
+{% macro sqlserver__delta_max_churn_percent() %}
+  {%- set percent = config.get('delta_max_churn_percent', 15) -%}
+  {%- if percent is not number or percent is sameas true or percent is sameas false
+        or percent < 0 or percent > 100 -%}
+    {{ exceptions.raise_compiler_error(
+      "Invalid delta_max_churn_percent '" ~ percent ~ "'. Use a number from 0 to 100 (default 15)."
+    ) }}
+  {%- endif -%}
+  {{- return(percent) -}}
+{% endmacro %}
+
+
 {% macro sqlserver__table_dml_refresh_stage(target_relation, sql, refresh_method='dml') %}
   {#-
     Schema resolution for the dml refresh: drop leftovers by name, create
@@ -177,6 +191,7 @@
     scratch table's Sch-M ends with its create) and after them under build.
     Returns the relations the load and the tail need, and the delta setup.
   -#}
+  {%- set churn_percent = sqlserver__delta_max_churn_percent() if refresh_method == 'delta' else none -%}
   {%- set refresh_relation = target_relation.incorporate(
       path={"identifier": target_relation.identifier ~ '__dbt_refresh'}
   ) -%}
@@ -244,7 +259,8 @@
     'gone_relation': gone_relation,
     'use_delta': use_delta,
     'delta_key': delta_key,
-    'delta_types': delta_types
+    'delta_types': delta_types,
+    'churn_percent': churn_percent
   }) }}
 {% endmacro %}
 
@@ -319,15 +335,15 @@
       {%- set gone_relation = stage['gone_relation'] -%}
       {%- set types = stage['delta_types'] -%}
       {%- set gone_names = sqlserver__delta_key_names(target_columns, types) -%}
-      {%- set churn_cap = '@dbt_rows * 15 / 100' -%}
       {#- delta: delete only the target rows the new build lacks and insert
           only the rows the target lacks. Falls back to the full swap, in the
           same transaction, when:
             duplicates  scratch has rows equal on every key: set operations
                         would collapse them (exact check, see
                         sqlserver__delta_dupes_sql)
-            churn       more than 15% of rows differ: past that the full swap
-                        is cheaper; TOP stops the EXCEPT once it is clear
+            churn       more than delta_max_churn_percent of rows differ:
+                        past that the full swap is cheaper; TOP stops the
+                        EXCEPT once it is clear
             count       target row count differs after the delta: it held
                         duplicates, or a CHECKSUM missed an equal row
           The CHECKSUM equality gives the delete a hashable join; INTERSECT
@@ -342,6 +358,7 @@
         {% endif %}
         DECLARE @dbt_rows bigint = (SELECT COUNT_BIG(*) FROM {{ refresh_relation }});
         DECLARE @dbt_path varchar(16) = 'delta';
+        DECLARE @dbt_cap bigint = CAST(@dbt_rows * {{ stage['churn_percent'] }} / 100.0 AS bigint);
 
         {{ sqlserver__delta_dupes_sql(target_columns, types, refresh_relation, stage['delta_key'], query_label) }}
         IF @dbt_dupes > 0
@@ -349,13 +366,13 @@
 
         IF @dbt_path = 'delta'
         BEGIN
-          INSERT TOP ({{ churn_cap }} + 1) INTO {{ gone_relation }} WITH (TABLOCK) ({{ gone_names }}, [__dbt_ck])
+          INSERT TOP (@dbt_cap + 1) INTO {{ gone_relation }} WITH (TABLOCK) ({{ gone_names }}, [__dbt_ck])
           SELECT {{ sqlserver__delta_key_names(target_columns, types, 'd') }}, CHECKSUM({{ sqlserver__delta_key_names(target_columns, types, 'd') }})
           FROM (SELECT {{ sqlserver__delta_keys(target_columns, types, 'l') }} FROM {{ target_relation }} l WITH (TABLOCKX)
                 EXCEPT
                 SELECT {{ sqlserver__delta_keys(target_columns, types, 's') }} FROM {{ refresh_relation }} s) d
           {{ query_label }}
-          IF @@ROWCOUNT > {{ churn_cap }}
+          IF @@ROWCOUNT > @dbt_cap
             SET @dbt_path = 'churn';
         END;
 

@@ -387,6 +387,12 @@ delta_json_vector_model_sql = """
 select id, doc, vec from {{ target.schema }}.json_vector_src
 """
 
+delta_cap_model_sql = """
+{{ config(materialized="table", table_refresh_method="delta", as_columnstore=False,
+          delta_max_churn_percent=var("cap", 15)) }}
+select id, val from {{ target.schema }}.cap_src
+"""
+
 delta_wide_model_sql = """
 {{ config(materialized="table", table_refresh_method="delta", as_columnstore=False) }}
 select 1 as id{% for i in range(520) %}, cast('x' as varchar(5)) as c{{ i }}{% endfor %}
@@ -401,6 +407,7 @@ class TestDeltaComparability:
             "text_alias_model.sql": delta_text_alias_model_sql,
             "wide_model.sql": delta_wide_model_sql,
             "json_vector_model.sql": delta_json_vector_model_sql,
+            "cap_model.sql": delta_cap_model_sql,
         }
 
     def test_alias_types_compare_as_their_base_type(self, project):
@@ -487,3 +494,36 @@ class TestDeltaComparability:
             execute(project, f"{values} {s}.json_vector_model", True)[0]
             == execute(project, f"{values} {s}.json_vector_src", True)[0]
         )
+
+    def test_churn_cap_is_configurable(self, project):
+        s = project.test_schema
+        execute(
+            project,
+            f"""
+            CREATE TABLE {s}.cap_src (id int, val varchar(20));
+            INSERT {s}.cap_src SELECT TOP (100) ROW_NUMBER() OVER (ORDER BY (SELECT NULL)), 'a'
+            FROM sys.all_objects;
+            """,
+        )
+        run_dbt(["run", "--select", "cap_model"])
+
+        def change(rows, val):
+            execute(project, f"UPDATE {s}.cap_src SET val = '{val}' WHERE id <= {rows}")
+
+        # (rows changed out of 100, cap, expected path); the cap rounds down to whole rows.
+        for rows, cap, path in [
+            (20, None, "churn"),
+            (20, 25, None),
+            (7, 7.5, None),
+            (8, 7.5, "churn"),
+            (1, 0, "churn"),
+        ]:
+            change(rows, f"{rows}-{cap}")
+            cap_vars = None if cap is None else f"cap: {cap}"
+            assert refresh(project, model="cap_model", vars=cap_vars) == path
+        assert refresh(project, model="cap_model", vars="cap: 0") is None  # nothing changed
+
+        results = run_dbt(
+            ["run", "--select", "cap_model", "--vars", "cap: 101"], expect_pass=False
+        )
+        assert "Invalid delta_max_churn_percent '101'" in results[0].message
